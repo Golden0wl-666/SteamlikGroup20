@@ -39,17 +39,14 @@ def load_artifacts(base: str = ART_DIR):
 
     # optional sample points for interactive map
     sample_path = os.path.join(base, "sample_points.csv")
-    if os.path.exists(sample_path):
-        pts = pd.read_csv(sample_path)
-        # ensure numeric
-        pts[LAT_COL] = pd.to_numeric(pts[LAT_COL], errors="coerce")
-        pts[LON_COL] = pd.to_numeric(pts[LON_COL], errors="coerce")
-        pts["Year"] = pd.to_numeric(pts["Year"], errors="coerce")
-        pts["Month"] = pd.to_numeric(pts["Month"], errors="coerce")
-        pts["Hour"] = pd.to_numeric(pts["Hour"], errors="coerce")
-        art["points"] = pts.dropna(subset=[LAT_COL, LON_COL])
-    else:
-        art["points"] = None
+    pts = pd.read_csv(sample_path)
+    # ensure numeric
+    pts[LAT_COL] = pd.to_numeric(pts[LAT_COL], errors="coerce")
+    pts[LON_COL] = pd.to_numeric(pts[LON_COL], errors="coerce")
+    pts["Year"] = pd.to_numeric(pts["Year"], errors="coerce")
+    pts["Month"] = pd.to_numeric(pts["Month"], errors="coerce")
+    pts["Hour"] = pd.to_numeric(pts["Hour"], errors="coerce")
+    art["points"] = pts.dropna(subset=[LAT_COL, LON_COL])
 
     return art
 
