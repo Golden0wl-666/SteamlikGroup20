@@ -150,11 +150,11 @@ def plot_year_trend(df_):
     st.plotly_chart(fig, use_container_width=True)
 
 def plot_monthly(df_):
-    fig = px.bar(df_.sort_values("Month"), x="Month", y="Total_Crimes", color = 'Month'title="Monthly Seasonality")
+    fig = px.bar(df_.sort_values("Month"), x="Month", y="Total_Crimes", color = 'Month', title="Monthly Seasonality")
     st.plotly_chart(fig, use_container_width=True)
 
 def plot_weekly(df_):
-    fig = px.bar(df_.sort_values("DayNum"), x="DayOfWeek", y="Total_Crimes", color = 'DayOfWeek'title="Weekly Cycle")
+    fig = px.bar(df_.sort_values("DayNum"), x="DayOfWeek", y="Total_Crimes", color = 'DayOfWeek', title="Weekly Cycle")
     st.plotly_chart(fig, use_container_width=True)
 
 def plot_top_types(df_):
