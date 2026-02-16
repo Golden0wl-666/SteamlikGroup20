@@ -376,12 +376,12 @@ else:
     st.caption("Overview mode: lightweight plots from artifacts")
     crime_options = sorted(art["top_types"]["Primary Type"].unique().tolist())
     crime_filter = st.multiselect("Crime types (optional, affects type-based charts)", crime_options, default=crime_options[:5])
-        if crime_filter:
-            hourly_topN_f = hourly_topN[hourly_topN["Primary Type"].isin(crime_filter)]
-            yearly_topN_f = yearly_topN[yearly_topN["Primary Type"].isin(crime_filter)]
-            arrest_yearly_topN_f = arrest_yearly_topN[arrest_yearly_topN["Primary Type"].isin(crime_filter)]
-        else:
-            hourly_topN_f, yearly_topN_f, arrest_yearly_topN_f = hourly_topN, yearly_topN, arrest_yearly_topN
+    if crime_filter:
+        hourly_topN_f = hourly_topN[hourly_topN["Primary Type"].isin(crime_filter)]
+        yearly_topN_f = yearly_topN[yearly_topN["Primary Type"].isin(crime_filter)]
+        arrest_yearly_topN_f = arrest_yearly_topN[arrest_yearly_topN["Primary Type"].isin(crime_filter)]
+    else:
+        hourly_topN_f, yearly_topN_f, arrest_yearly_topN_f = hourly_topN, yearly_topN, arrest_yearly_topN
     t1, t2 = st.tabs(["Interactive overview", "Professional overview"])
     with t1:
         plot_year_trend(yearly)
