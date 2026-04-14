@@ -4,3 +4,5 @@ numpy
 matplotlib
 plotly
 statsmodels
+onnxruntime
+scipy
