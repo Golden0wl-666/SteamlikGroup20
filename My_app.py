@@ -1,6 +1,4 @@
-import os
 import json
-from types import SimpleNamespace
 from pathlib import Path
 
 import numpy as np
@@ -8,47 +6,54 @@ import pandas as pd
 import streamlit as st
 import matplotlib.pyplot as plt
 import plotly.express as px
-import scipy.sparse as sp
-try:
-    import torch
-    TORCH_AVAILABLE = True
-except:
-    TORCH_AVAILABLE = False
+import onnxruntime as ort
 
 from pandas.tseries.holiday import USFederalHolidayCalendar
 
-from model import models
-from utility import calc_gso, calc_chebynet_gso
 
+# =========================
 # Paths / constants
-
+# =========================
 APP_DIR = Path(__file__).resolve().parent
 ART_DIR = APP_DIR / "artifacts"
 DATA_DIR = ART_DIR / "data_v2"
 MODEL_DIR = APP_DIR / "models"
+FIG_DIR = APP_DIR / "figures"
+OUTPUT_DIR = APP_DIR / "outputs"
 
 LAT_COL, LON_COL = "Latitude", "Longitude"
-
-DEFAULT_HORIZON_SLOTS = 6  # same as train_stgcn.py default
+DEFAULT_HORIZON_SLOTS = 6
 CRIME_TYPES = ["THEFT", "BATTERY", "CRIMINAL DAMAGE", "ASSAULT", "DECEPTIVE PRACTICE"]
 
-st.set_page_config(page_title="Chicago Crime Analytics + STGCN", layout="wide")
+st.set_page_config(page_title="Chicago Crime Analytics + STGCN (ONNX)", layout="wide")
 st.title("Chicago Crime Analytics and STGCN Prediction Dashboard")
-st.caption("EDA + proof-of-concept spatiotemporal forecasting app")
+st.caption("EDA + ONNX-based spatiotemporal forecasting app")
 
-# Generic loaders
+
+# =========================
+# Generic helpers
+# =========================
+def first_existing(*paths: Path):
+    for p in paths:
+        if p.exists():
+            return p
+    return None
+
 
 def safe_read_csv(path: Path):
-    return pd.read_csv(path) if path.exists() else None
+    return pd.read_csv(path) if path and path.exists() else None
 
 
 def safe_read_json(path: Path):
-    if path.exists():
+    if path and path.exists():
         with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
     return None
 
 
+# =========================
+# Artifact loading
+# =========================
 @st.cache_data
 def load_artifacts():
     art = {}
@@ -67,9 +72,15 @@ def load_artifacts():
     art["points"] = safe_read_csv(ART_DIR / "sample_points.csv")
 
     # Metrics / metadata
-    art["metrics_overall"] = safe_read_json(ART_DIR / "metrics_overall.json")
-    art["metrics_compare"] = safe_read_json(ART_DIR / "metrics_compare_vs_xgboost.json")
-    art["split_info"] = safe_read_json(ART_DIR / "split_info.json")
+    art["metrics_overall"] = safe_read_json(
+        first_existing(APP_DIR / "metrics_overall.json", ART_DIR / "metrics_overall.json")
+    )
+    art["metrics_compare"] = safe_read_json(
+        first_existing(APP_DIR / "metrics_compare_vs_xgboost.json", ART_DIR / "metrics_compare_vs_xgboost.json")
+    )
+    art["split_info"] = safe_read_json(
+        first_existing(OUTPUT_DIR / "split_info.json", APP_DIR / "split_info.json", ART_DIR / "split_info.json")
+    )
 
     # Data_v2 meta
     art["meta"] = safe_read_json(DATA_DIR / "meta.json")
@@ -84,8 +95,8 @@ def load_artifacts():
         "test_pred_vs_true_type0.png",
     ]
     for name in image_names:
-        p = ART_DIR / name
-        if p.exists():
+        p = first_existing(FIG_DIR / name, ART_DIR / name)
+        if p:
             art["images"][name] = p
 
     # Cleanup
@@ -101,7 +112,10 @@ def load_artifacts():
 
     return art
 
+
+# =========================
 # EDA helpers
+# =========================
 def filter_year(df: pd.DataFrame, year_range):
     if df is None or "Year" not in df.columns:
         return df
@@ -238,61 +252,33 @@ def plot_location_map(points_df, year_range, crime_filter):
     )
     st.plotly_chart(fig, use_container_width=True)
 
-# Model config / loading
-def build_model_config(device: torch.device):
-    args = SimpleNamespace(
-        Kt=3,
-        Ks=3,
-        n_his=180,
-        stblock_num=2,
-        act_func="glu",
-        graph_conv_type="cheb_graph_conv",
-        gso_type="sym_norm_lap",
-        enable_bias=True,
-        droprate=0.3,
-    )
 
-    adj = sp.load_npz(DATA_DIR / "adj.npz").tocsc()
-    gso = calc_gso(adj, args.gso_type)
-    gso = calc_chebynet_gso(gso)
-    gso_np = gso.toarray().astype(np.float32)
-    args.gso = torch.from_numpy(gso_np).to(device)
-
-    # Same logic as build_blocks(... hidden_channels=32, stblock_num=2, n_types=5)
-    blocks = [
-        [5],
-        [32, 8, 32],
-        [32, 8, 32],
-        [32, 32],
-        [5],
-    ]
-    n_vertex = 1505
-    return args, blocks, n_vertex
-
-
+# =========================
+# ONNX loading
+# =========================
 @st.cache_resource
-def load_stgcn_model():
-    device = torch.device("cpu")
-    args, blocks, n_vertex = build_model_config(device)
+def load_onnx_session():
+    onnx_path = MODEL_DIR / "stgcn_best.onnx"
+    if not onnx_path.exists():
+        raise FileNotFoundError(f"Missing ONNX model: {onnx_path}")
 
-    model = models.STGCNChebGraphConv(args, blocks, n_vertex).to(device)
-    ckpt_path = MODEL_DIR / "stgcn_best.pt"
-    state = torch.load(ckpt_path, map_location=device)
+    session = ort.InferenceSession(
+        str(onnx_path),
+        providers=["CPUExecutionProvider"]
+    )
+    return session
 
-    if isinstance(state, dict) and "state_dict" in state:
-        model.load_state_dict(state["state_dict"], strict=False)
-    else:
-        model.load_state_dict(state, strict=False)
 
-    model.eval()
-    return model
-
+# =========================
 # Prediction preprocess
-
+# =========================
 @st.cache_data
 def load_tensor_and_meta():
     meta = safe_read_json(DATA_DIR / "meta.json")
-    tensor = np.load(DATA_DIR / "demo_tensor.npy", mmap_mode="r")
+    tensor_path = first_existing(DATA_DIR / "demo_tensor.npy", DATA_DIR / "tensor.npy")
+    if tensor_path is None:
+        raise FileNotFoundError("Neither demo_tensor.npy nor tensor.npy was found in artifacts/data_v2/")
+    tensor = np.load(tensor_path, mmap_mode="r")
     return tensor, meta
 
 
@@ -300,14 +286,16 @@ def make_demo_input(horizon_slots: int = DEFAULT_HORIZON_SLOTS):
     tensor, meta = load_tensor_and_meta()
 
     lookback = int(meta["lookback"])
-    val_end = int(meta["val_end"])
-    n_steps = int(meta["n_steps"])
+    val_end = int(meta.get("val_end", lookback))
+    n_steps = int(meta.get("n_steps", tensor.shape[0]))
 
     anchor_t = val_end
-    target_t = anchor_t + horizon_slots
+    if anchor_t < lookback:
+        anchor_t = lookback
 
-    if target_t >= n_steps:
-        raise ValueError("Demo target index exceeds tensor length.")
+    target_t = anchor_t + horizon_slots
+    if target_t >= tensor.shape[0]:
+        target_t = tensor.shape[0] - 1
 
     x = np.asarray(tensor[anchor_t - lookback: anchor_t], dtype=np.float32)   # (L, N, C)
     y_true = np.asarray(tensor[target_t], dtype=np.float32)                    # (N, C)
@@ -324,23 +312,19 @@ def make_demo_input(horizon_slots: int = DEFAULT_HORIZON_SLOTS):
         "lookback": lookback,
         "horizon_slots": horizon_slots,
     }
-    return torch.tensor(x, dtype=torch.float32), y_true, info
+    return x.astype(np.float32), y_true.astype(np.float32), info
 
 
 def preprocess_uploaded_csv(df: pd.DataFrame):
     """
-    Supported CSV formats:
-
-    Format A (recommended):
+    Format A:
       columns = [time_idx, grid_id, THEFT, BATTERY, CRIMINAL DAMAGE, ASSAULT, DECEPTIVE PRACTICE]
-      rows = 180 * 1505
 
     Format B:
       a flattened numeric CSV containing exactly 5 * 180 * 1505 values
     """
     required_cols = {"time_idx", "grid_id", *CRIME_TYPES}
 
-    # Format A: long table with 180*1505 rows
     if required_cols.issubset(df.columns):
         tmp = df.copy()
 
@@ -366,9 +350,8 @@ def preprocess_uploaded_csv(df: pd.DataFrame):
         x = np.log1p(x)
         x = np.expand_dims(x, 0)                                # (1, C, L, N)
 
-        return torch.tensor(x, dtype=torch.float32)
+        return x.astype(np.float32)
 
-    # Format B: flattened numeric CSV
     numeric = df.select_dtypes(include=[np.number])
     arr = numeric.values.flatten()
 
@@ -382,27 +365,37 @@ def preprocess_uploaded_csv(df: pd.DataFrame):
 
     x = arr.astype(np.float32).reshape(1, 5, 180, 1505)
     x = np.log1p(x)
-    return torch.tensor(x, dtype=torch.float32)
+    return x.astype(np.float32)
 
 
+# =========================
 # Inference / visualization
+# =========================
+def run_inference(session, x_array: np.ndarray):
+    input_name = session.get_inputs()[0].name
+    output_name = session.get_outputs()[0].name
 
-def run_inference(model, x_tensor):
-    if TORCH_AVAILABLE:
-        with torch.no_grad():
-            pred_log = model(x_tensor).squeeze(2).cpu().numpy()[0]
-        pred_count = np.expm1(pred_log)
-        return pred_count
-    else:
-        pred_count = np.load("artifacts/demo_pred.npy")
-        return pred_count
+    pred = session.run([output_name], {input_name: x_array})[0]
+    pred = np.asarray(pred)
+
+    # 兼容导出后常见形状
+    if pred.ndim == 4:
+        pred = np.squeeze(pred, axis=2) if pred.shape[2] == 1 else pred
+    if pred.ndim == 3:
+        pred = pred[0]
+
+    if pred.shape != (5, 1505):
+        raise ValueError(f"Unexpected ONNX output shape: {pred.shape}")
+
+    pred_count = np.expm1(pred)
+    pred_count = np.clip(pred_count, 0, None)
+    return pred_count.astype(np.float32)
 
 
 def get_grid_shape(meta: dict):
     n_rows = int(meta.get("n_rows", 43))
     n_cols = int(meta.get("n_cols", 35))
     if n_rows * n_cols != int(meta["n_grids"]):
-        # fallback
         return 43, 35
     return n_rows, n_cols
 
@@ -470,17 +463,17 @@ def render_metrics_panel(art):
         c2.metric("Avg Test RMSE", f"{metrics_overall.get('avg_test_rmse', 0):.4f}")
         c3.metric("Avg Test Accuracy", f"{metrics_overall.get('avg_test_acc', 0):.4f}")
 
-    if split_info:
+    if split_info and isinstance(split_info, dict) and "fields_used" in split_info:
         st.info(
-            f"Lookback = {split_info['fields_used']['lookback']} steps, "
-            f"Grids = {split_info['fields_used']['n_grids']}, "
-            f"Crime types = {split_info['fields_used']['n_types']}."
+            f"Lookback = {split_info['fields_used'].get('lookback', 'NA')} steps, "
+            f"Grids = {split_info['fields_used'].get('n_grids', 'NA')}, "
+            f"Crime types = {split_info['fields_used'].get('n_types', 'NA')}."
         )
     elif meta:
         st.info(
-            f"Lookback = {meta['lookback']} steps, "
-            f"Grids = {meta['n_grids']}, "
-            f"Crime types = {meta['n_types']}."
+            f"Lookback = {meta.get('lookback', 'NA')} steps, "
+            f"Grids = {meta.get('n_grids', 'NA')}, "
+            f"Crime types = {meta.get('n_types', 'NA')}."
         )
 
     if metrics_compare:
@@ -530,8 +523,9 @@ def render_prediction_results(y_pred, art, source_name, y_true=None, demo_info=N
     render_metrics_panel(art)
 
 
+# =========================
 # Page renderers
-
+# =========================
 def render_eda_page(art):
     st.header("EDA Dashboard")
 
@@ -632,17 +626,22 @@ def render_eda_page(art):
 
 
 def render_prediction_page(art):
-    st.header("STGCN Prediction")
+    st.header("STGCN Prediction (ONNX)")
 
-    model = load_stgcn_model()
+    try:
+        session = load_onnx_session()
+    except Exception as e:
+        st.error(f"Failed to load ONNX model: {e}")
+        return
+
     mode = st.radio("Choose input mode", ["Demo", "CSV Upload"], horizontal=True)
 
     if mode == "Demo":
-        st.write("Run one real sample from the prepared tensor on the trained STGCN model.")
+        st.write("Run one prepared sample on the exported ONNX STGCN model.")
         if st.button("Run Demo Prediction"):
             try:
-                x_tensor, y_true, info = make_demo_input(DEFAULT_HORIZON_SLOTS)
-                y_pred = run_inference(model, x_tensor)
+                x_array, y_true, info = make_demo_input(DEFAULT_HORIZON_SLOTS)
+                y_pred = run_inference(session, x_array)
                 render_prediction_results(y_pred, art, source_name="Demo", y_true=y_true, demo_info=info)
             except Exception as e:
                 st.error(f"Demo prediction failed: {e}")
@@ -665,8 +664,8 @@ def render_prediction_page(art):
                 st.dataframe(df.head(), use_container_width=True)
 
                 if st.button("Run CSV Prediction"):
-                    x_tensor = preprocess_uploaded_csv(df)
-                    y_pred = run_inference(model, x_tensor)
+                    x_array = preprocess_uploaded_csv(df)
+                    y_pred = run_inference(session, x_array)
                     render_prediction_results(y_pred, art, source_name="CSV Upload")
             except Exception as e:
                 st.error(f"CSV prediction failed: {e}")
@@ -678,7 +677,7 @@ def render_about_page(art):
         """
         This dashboard combines:
         - EDA for Chicago crime data
-        - STGCN-based spatiotemporal forecasting
+        - ONNX-based STGCN forecasting
         - Demo mode and CSV upload mode
         - Static model evaluation artifacts
         """
@@ -693,8 +692,10 @@ def render_about_page(art):
         with st.expander("metrics_overall.json"):
             st.json(art["metrics_overall"])
 
-# Main
 
+# =========================
+# Main
+# =========================
 def main():
     art = load_artifacts()
 
