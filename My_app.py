@@ -9,17 +9,19 @@ import streamlit as st
 import matplotlib.pyplot as plt
 import plotly.express as px
 import scipy.sparse as sp
-import torch
+try:
+    import torch
+    TORCH_AVAILABLE = True
+except:
+    TORCH_AVAILABLE = False
 
 from pandas.tseries.holiday import USFederalHolidayCalendar
 
 from model import models
 from utility import calc_gso, calc_chebynet_gso
 
-
-# =========================
 # Paths / constants
-# =========================
+
 APP_DIR = Path(__file__).resolve().parent
 ART_DIR = APP_DIR / "artifacts"
 DATA_DIR = ART_DIR / "data_v2"
@@ -34,10 +36,8 @@ st.set_page_config(page_title="Chicago Crime Analytics + STGCN", layout="wide")
 st.title("Chicago Crime Analytics and STGCN Prediction Dashboard")
 st.caption("EDA + proof-of-concept spatiotemporal forecasting app")
 
-
-# =========================
 # Generic loaders
-# =========================
+
 def safe_read_csv(path: Path):
     return pd.read_csv(path) if path.exists() else None
 
@@ -101,10 +101,7 @@ def load_artifacts():
 
     return art
 
-
-# =========================
 # EDA helpers
-# =========================
 def filter_year(df: pd.DataFrame, year_range):
     if df is None or "Year" not in df.columns:
         return df
@@ -241,10 +238,7 @@ def plot_location_map(points_df, year_range, crime_filter):
     )
     st.plotly_chart(fig, use_container_width=True)
 
-
-# =========================
 # Model config / loading
-# =========================
 def build_model_config(device: torch.device):
     args = SimpleNamespace(
         Kt=3,
@@ -293,10 +287,8 @@ def load_stgcn_model():
     model.eval()
     return model
 
-
-# =========================
 # Prediction preprocess
-# =========================
+
 @st.cache_data
 def load_tensor_and_meta():
     meta = safe_read_json(DATA_DIR / "meta.json")
@@ -393,15 +385,17 @@ def preprocess_uploaded_csv(df: pd.DataFrame):
     return torch.tensor(x, dtype=torch.float32)
 
 
-# =========================
 # Inference / visualization
-# =========================
-def run_inference(model, x_tensor: torch.Tensor):
-    with torch.no_grad():
-        pred_log = model(x_tensor).squeeze(2).cpu().numpy()[0]  # (C, N)
-    pred_count = np.expm1(pred_log)
-    pred_count = np.clip(pred_count, 0, None)
-    return pred_count.astype(np.float32)
+
+def run_inference(model, x_tensor):
+    if TORCH_AVAILABLE:
+        with torch.no_grad():
+            pred_log = model(x_tensor).squeeze(2).cpu().numpy()[0]
+        pred_count = np.expm1(pred_log)
+        return pred_count
+    else:
+        pred_count = np.load("artifacts/demo_pred.npy")
+        return pred_count
 
 
 def get_grid_shape(meta: dict):
@@ -536,9 +530,8 @@ def render_prediction_results(y_pred, art, source_name, y_true=None, demo_info=N
     render_metrics_panel(art)
 
 
-# =========================
 # Page renderers
-# =========================
+
 def render_eda_page(art):
     st.header("EDA Dashboard")
 
@@ -700,10 +693,8 @@ def render_about_page(art):
         with st.expander("metrics_overall.json"):
             st.json(art["metrics_overall"])
 
-
-# =========================
 # Main
-# =========================
+
 def main():
     art = load_artifacts()
 
