@@ -300,7 +300,7 @@ def load_stgcn_model():
 @st.cache_data
 def load_tensor_and_meta():
     meta = safe_read_json(DATA_DIR / "meta.json")
-    tensor = np.load(DATA_DIR / "tensor.npy", mmap_mode="r")
+    tensor = np.load(DATA_DIR / "demo_tensor.npy", mmap_mode="r")
     return tensor, meta
 
 
