@@ -1,93 +1,98 @@
 import os
 import json
+from types import SimpleNamespace
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 import streamlit as st
 import matplotlib.pyplot as plt
 import plotly.express as px
+import scipy.sparse as sp
 import torch
 
 from pandas.tseries.holiday import USFederalHolidayCalendar
 
-# =========================
-# Optional model import
-# =========================
-# TODO:
-# 1) 把你们自己的模型定义文件放到 model/model_def.py
-# 2) 确认类名是否是 STGCNGraphConv 或 STGCNChebGraphConv
-# 3) 确认 layers.py 已存在于 model/ 下
-try:
-    from model.model_def import STGCNGraphConv
-except Exception:
-    STGCNGraphConv = None
+from model import models
+from utility import calc_gso, calc_chebynet_gso
 
 
 # =========================
-# Basic config
+# Paths / constants
 # =========================
+APP_DIR = Path(__file__).resolve().parent
+ART_DIR = APP_DIR / "artifacts"
+DATA_DIR = ART_DIR / "data_v2"
+MODEL_DIR = APP_DIR / "models"
+
 LAT_COL, LON_COL = "Latitude", "Longitude"
-ART_DIR = "artifacts"
-MODEL_DIR = "models"
 
-st.set_page_config(page_title="Chicago Crime EDA + STGCN Demo", layout="wide")
+DEFAULT_HORIZON_SLOTS = 6  # same as train_stgcn.py default
+CRIME_TYPES = ["THEFT", "BATTERY", "CRIMINAL DAMAGE", "ASSAULT", "DECEPTIVE PRACTICE"]
+
+st.set_page_config(page_title="Chicago Crime Analytics + STGCN", layout="wide")
 st.title("Chicago Crime Analytics and STGCN Prediction Dashboard")
-st.caption("EDA + proof-of-concept deployment for crime forecasting")
+st.caption("EDA + proof-of-concept spatiotemporal forecasting app")
 
 
 # =========================
-# Artifact loaders
+# Generic loaders
 # =========================
+def safe_read_csv(path: Path):
+    return pd.read_csv(path) if path.exists() else None
+
+
+def safe_read_json(path: Path):
+    if path.exists():
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return None
+
+
 @st.cache_data
-def load_artifacts(base: str = ART_DIR):
+def load_artifacts():
     art = {}
 
-    def safe_read_csv(path):
-        return pd.read_csv(path) if os.path.exists(path) else None
-
-    def safe_read_json(path):
-        if os.path.exists(path):
-            with open(path, "r", encoding="utf-8") as f:
-                return json.load(f)
-        return None
-
-    # EDA artifacts
-    art["yearly"] = safe_read_csv(os.path.join(base, "agg_yearly.csv"))
-    art["monthly"] = safe_read_csv(os.path.join(base, "agg_monthly.csv"))
-    art["weekly"] = safe_read_csv(os.path.join(base, "agg_weekly.csv"))
-    art["daily"] = safe_read_csv(os.path.join(base, "agg_daily.csv"))
-    art["top_types"] = safe_read_csv(os.path.join(base, "top_types.csv"))
-    art["hourly_topN"] = safe_read_csv(os.path.join(base, "hourly_by_type_topN.csv"))
-    art["yearly_topN"] = safe_read_csv(os.path.join(base, "yearly_by_type_topN.csv"))
-    art["arrest_yearly"] = safe_read_csv(os.path.join(base, "arrest_rate_yearly.csv"))
-    art["arrest_yearly_topN"] = safe_read_csv(os.path.join(base, "arrest_rate_yearly_topN.csv"))
-    art["grid"] = safe_read_csv(os.path.join(base, "spatial_grid_precomputed.csv"))
-    art["points"] = safe_read_csv(os.path.join(base, "sample_points.csv"))
+    # EDA tables
+    art["yearly"] = safe_read_csv(ART_DIR / "agg_yearly.csv")
+    art["monthly"] = safe_read_csv(ART_DIR / "agg_monthly.csv")
+    art["weekly"] = safe_read_csv(ART_DIR / "agg_weekly.csv")
+    art["daily"] = safe_read_csv(ART_DIR / "agg_daily.csv")
+    art["top_types"] = safe_read_csv(ART_DIR / "top_types.csv")
+    art["hourly_topN"] = safe_read_csv(ART_DIR / "hourly_by_type_topN.csv")
+    art["yearly_topN"] = safe_read_csv(ART_DIR / "yearly_by_type_topN.csv")
+    art["arrest_yearly"] = safe_read_csv(ART_DIR / "arrest_rate_yearly.csv")
+    art["arrest_yearly_topN"] = safe_read_csv(ART_DIR / "arrest_rate_yearly_topN.csv")
+    art["grid"] = safe_read_csv(ART_DIR / "spatial_grid_precomputed.csv")
+    art["points"] = safe_read_csv(ART_DIR / "sample_points.csv")
 
     # Metrics / metadata
-    art["split_info"] = safe_read_json(os.path.join(base, "split_info.json"))
-    art["metrics_compare"] = safe_read_json(os.path.join(base, "metrics_compare_vs_xgboost.json"))
-    art["metrics_overall"] = safe_read_json(os.path.join(base, "metrics_overall.json"))
+    art["metrics_overall"] = safe_read_json(ART_DIR / "metrics_overall.json")
+    art["metrics_compare"] = safe_read_json(ART_DIR / "metrics_compare_vs_xgboost.json")
+    art["split_info"] = safe_read_json(ART_DIR / "split_info.json")
+
+    # Data_v2 meta
+    art["meta"] = safe_read_json(DATA_DIR / "meta.json")
 
     # Images
+    art["images"] = {}
     image_names = [
         "metrics_by_crime_type.png",
         "accuracy_by_crime_type.png",
-        "test_pred_vs_true_type0.png",
         "compare_stgcn_vs_xgboost.png",
         "loss_curve.png",
+        "test_pred_vs_true_type0.png",
     ]
-    art["images"] = {}
     for name in image_names:
-        p = os.path.join(base, name)
-        if os.path.exists(p):
+        p = ART_DIR / name
+        if p.exists():
             art["images"][name] = p
 
-    # daily datetime cleanup
+    # Cleanup
     if art["daily"] is not None and "Date" in art["daily"].columns:
         art["daily"]["Date"] = pd.to_datetime(art["daily"]["Date"], errors="coerce")
         art["daily"] = art["daily"].dropna(subset=["Date"]).sort_values("Date")
 
-    # point cleanup
     if art["points"] is not None:
         for c in [LAT_COL, LON_COL, "Year", "Month", "Hour"]:
             if c in art["points"].columns:
@@ -97,6 +102,9 @@ def load_artifacts(base: str = ART_DIR):
     return art
 
 
+# =========================
+# EDA helpers
+# =========================
 def filter_year(df: pd.DataFrame, year_range):
     if df is None or "Year" not in df.columns:
         return df
@@ -120,29 +128,31 @@ def mark_holidays_daily(daily_df: pd.DataFrame):
     return out
 
 
-# =========================
-# Plot helpers (EDA)
-# =========================
 def plot_year_trend(df_):
     fig = px.line(df_, x="Year", y="Total_Crimes", markers=True, title="Annual Crime Trend")
     st.plotly_chart(fig, use_container_width=True)
+
 
 def plot_monthly(df_):
     fig = px.bar(df_.sort_values("Month"), x="Month", y="Total_Crimes", color="Month", title="Monthly Seasonality")
     st.plotly_chart(fig, use_container_width=True)
 
+
 def plot_weekly(df_):
     fig = px.bar(df_.sort_values("DayNum"), x="DayOfWeek", y="Total_Crimes", color="DayOfWeek", title="Weekly Cycle")
     st.plotly_chart(fig, use_container_width=True)
+
 
 def plot_top_types(df_):
     fig = px.bar(df_, x="Primary Type", y="Total_Crimes", color="Primary Type", title="Top Crime Types")
     st.plotly_chart(fig, use_container_width=True)
 
+
 def plot_hourly_by_type(df_):
     fig = px.line(df_, x="Hour", y="Total_Crimes", color="Primary Type", markers=True,
                   title="Hourly Crime Pattern by Type")
     st.plotly_chart(fig, use_container_width=True)
+
 
 def plot_structure_over_time(df_):
     pivot = df_.pivot_table(index="Year", columns="Primary Type", values="Total_Crimes", fill_value=0)
@@ -155,11 +165,13 @@ def plot_structure_over_time(df_):
     ax.legend(bbox_to_anchor=(1.02, 1), loc="upper left")
     st.pyplot(fig, use_container_width=True)
 
+
 def plot_arrest_rate(df_):
     tmp = df_.copy()
     tmp["Arrest_Rate_%"] = tmp["Arrest_Rate"] * 100
     fig = px.line(tmp, x="Year", y="Arrest_Rate_%", markers=True, title="Arrest Rate by Year (%)")
     st.plotly_chart(fig, use_container_width=True)
+
 
 def plot_arrest_rate_by_type(df_):
     tmp = df_.copy()
@@ -168,11 +180,13 @@ def plot_arrest_rate_by_type(df_):
                   title="Arrest Rate by Crime Type")
     st.plotly_chart(fig, use_container_width=True)
 
+
 def plot_holiday(daily_df):
     dfh = mark_holidays_daily(daily_df)
     comp = dfh.groupby("Period_Type")["Total_Crimes"].mean().reset_index()
     fig = px.bar(comp, x="Period_Type", y="Total_Crimes", title="Mean Daily Crimes: Holiday vs Normal")
     st.plotly_chart(fig, use_container_width=True)
+
 
 def plot_moran(grid_df):
     fig, ax = plt.subplots(figsize=(6.5, 6))
@@ -185,6 +199,7 @@ def plot_moran(grid_df):
     ax.set_xlabel("Standardized cell count (z)")
     ax.set_ylabel("Spatial lag (rook mean)")
     st.pyplot(fig, use_container_width=True)
+
 
 def plot_gistar(grid_df):
     fig, ax = plt.subplots(figsize=(7, 6))
@@ -201,6 +216,7 @@ def plot_gistar(grid_df):
     ax2.set_ylabel("Latitude")
     st.pyplot(fig2, use_container_width=True)
 
+
 def plot_location_map(points_df, year_range, crime_filter):
     if points_df is None:
         st.info("No sample_points.csv found.")
@@ -215,212 +231,244 @@ def plot_location_map(points_df, year_range, crime_filter):
         return
     fig = px.density_mapbox(
         tmp,
-        lat=LAT_COL, lon=LON_COL,
+        lat=LAT_COL,
+        lon=LON_COL,
         radius=10,
         center=dict(lat=41.8781, lon=-87.6298),
         zoom=10,
         mapbox_style="carto-positron",
-        hover_data=[c for c in ["Primary Type", "Location Description"] if c in tmp.columns]
+        hover_data=[c for c in ["Primary Type", "Location Description"] if c in tmp.columns],
     )
     st.plotly_chart(fig, use_container_width=True)
 
 
 # =========================
-# STGCN config
+# Model config / loading
 # =========================
-def build_model_config():
-    """
-    TODO:
-    用你们训练时真实的 args / blocks / n_vertex 替换这里。
-    这里先给一个占位写法。
-    """
-    class Args:
-        Kt = 3
-        Ks = 3
-        n_his = 180
-        act_func = "glu"
-        graph_conv_type = "graph_conv"
-        gso = None
-        enable_bias = True
-        droprate = 0.3
+def build_model_config(device: torch.device):
+    args = SimpleNamespace(
+        Kt=3,
+        Ks=3,
+        n_his=180,
+        stblock_num=2,
+        act_func="glu",
+        graph_conv_type="cheb_graph_conv",
+        gso_type="sym_norm_lap",
+        enable_bias=True,
+        droprate=0.3,
+    )
 
-    args = Args()
+    adj = sp.load_npz(DATA_DIR / "adj.npz").tocsc()
+    gso = calc_gso(adj, args.gso_type)
+    gso = calc_chebynet_gso(gso)
+    gso_np = gso.toarray().astype(np.float32)
+    args.gso = torch.from_numpy(gso_np).to(device)
 
-    # TODO: 用你们训练时真实 blocks 替换
+    # Same logic as build_blocks(... hidden_channels=32, stblock_num=2, n_types=5)
     blocks = [
         [5],
-        [64, 16, 64],
-        [64, 16, 64],
-        [128],
-        [5]
+        [32, 8, 32],
+        [32, 8, 32],
+        [32, 32],
+        [5],
     ]
-
     n_vertex = 1505
     return args, blocks, n_vertex
 
 
 @st.cache_resource
 def load_stgcn_model():
-    if STGCNGraphConv is None:
-        return None, "Model definition import failed. Please check model/model_def.py and model/layers.py."
+    device = torch.device("cpu")
+    args, blocks, n_vertex = build_model_config(device)
 
-    model_path = os.path.join(MODEL_DIR, "stgcn_best.pt")
-    if not os.path.exists(model_path):
-        return None, f"Model file not found: {model_path}"
+    model = models.STGCNChebGraphConv(args, blocks, n_vertex).to(device)
+    ckpt_path = MODEL_DIR / "stgcn_best.pt"
+    state = torch.load(ckpt_path, map_location=device)
 
-    try:
-        args, blocks, n_vertex = build_model_config()
-        model = STGCNGraphConv(args, blocks, n_vertex)
+    if isinstance(state, dict) and "state_dict" in state:
+        model.load_state_dict(state["state_dict"], strict=False)
+    else:
+        model.load_state_dict(state, strict=False)
 
-        state = torch.load(model_path, map_location="cpu")
-        if isinstance(state, dict) and "state_dict" in state:
-            model.load_state_dict(state["state_dict"], strict=False)
-        else:
-            model.load_state_dict(state, strict=False)
-
-        model.eval()
-        return model, None
-    except Exception as e:
-        return None, f"Model loading failed: {e}"
+    model.eval()
+    return model
 
 
 # =========================
-# Input preprocess
+# Prediction preprocess
 # =========================
-def preprocess_demo_input():
-    """
-    Demo 输入推荐保存成 models/demo_input.npy
-    shape 推荐: [1, 5, 180, 1505]
-    """
-    demo_path = os.path.join(MODEL_DIR, "demo_input.npy")
-    if not os.path.exists(demo_path):
-        raise FileNotFoundError("models/demo_input.npy not found")
+@st.cache_data
+def load_tensor_and_meta():
+    meta = safe_read_json(DATA_DIR / "meta.json")
+    tensor = np.load(DATA_DIR / "tensor.npy", mmap_mode="r")
+    return tensor, meta
 
-    x = np.load(demo_path)
-    if x.ndim != 4:
-        raise ValueError(f"demo_input.npy must be 4D, got shape={x.shape}")
 
-    return torch.tensor(x, dtype=torch.float32)
+def make_demo_input(horizon_slots: int = DEFAULT_HORIZON_SLOTS):
+    tensor, meta = load_tensor_and_meta()
+
+    lookback = int(meta["lookback"])
+    val_end = int(meta["val_end"])
+    n_steps = int(meta["n_steps"])
+
+    anchor_t = val_end
+    target_t = anchor_t + horizon_slots
+
+    if target_t >= n_steps:
+        raise ValueError("Demo target index exceeds tensor length.")
+
+    x = np.asarray(tensor[anchor_t - lookback: anchor_t], dtype=np.float32)   # (L, N, C)
+    y_true = np.asarray(tensor[target_t], dtype=np.float32)                    # (N, C)
+
+    x = np.transpose(x, (2, 0, 1))   # (C, L, N)
+    x = np.log1p(x)
+    x = np.expand_dims(x, 0)         # (1, C, L, N)
+
+    y_true = np.transpose(y_true, (1, 0))  # (C, N)
+
+    info = {
+        "anchor_t": anchor_t,
+        "target_t": target_t,
+        "lookback": lookback,
+        "horizon_slots": horizon_slots,
+    }
+    return torch.tensor(x, dtype=torch.float32), y_true, info
 
 
 def preprocess_uploaded_csv(df: pd.DataFrame):
     """
-    TODO:
-    这里必须替换成你们真实的 CSV -> tensor 逻辑。
+    Supported CSV formats:
 
-    当前假设：
-    - CSV 内只包含数值
-    - 总元素数量 = 5 * 180 * 1505
-    - reshape 到 [1, 5, 180, 1505]
+    Format A (recommended):
+      columns = [time_idx, grid_id, THEFT, BATTERY, CRIMINAL DAMAGE, ASSAULT, DECEPTIVE PRACTICE]
+      rows = 180 * 1505
+
+    Format B:
+      a flattened numeric CSV containing exactly 5 * 180 * 1505 values
     """
-    arr = df.select_dtypes(include=[np.number]).values.flatten()
+    required_cols = {"time_idx", "grid_id", *CRIME_TYPES}
+
+    # Format A: long table with 180*1505 rows
+    if required_cols.issubset(df.columns):
+        tmp = df.copy()
+
+        tmp["time_idx"] = pd.to_numeric(tmp["time_idx"], errors="raise").astype(int)
+        tmp["grid_id"] = pd.to_numeric(tmp["grid_id"], errors="raise").astype(int)
+
+        if tmp["time_idx"].min() != 0 or tmp["time_idx"].max() != 179:
+            raise ValueError("time_idx must span exactly 0..179.")
+        if tmp["grid_id"].min() != 0 or tmp["grid_id"].max() != 1504:
+            raise ValueError("grid_id must span exactly 0..1504.")
+
+        expected_rows = 180 * 1505
+        if len(tmp) != expected_rows:
+            raise ValueError(f"Expected {expected_rows} rows, got {len(tmp)}.")
+
+        tmp = tmp.sort_values(["time_idx", "grid_id"]).reset_index(drop=True)
+
+        for c in CRIME_TYPES:
+            tmp[c] = pd.to_numeric(tmp[c], errors="raise").astype(np.float32)
+
+        values = tmp[CRIME_TYPES].values.reshape(180, 1505, 5)  # (L, N, C)
+        x = np.transpose(values, (2, 0, 1))                     # (C, L, N)
+        x = np.log1p(x)
+        x = np.expand_dims(x, 0)                                # (1, C, L, N)
+
+        return torch.tensor(x, dtype=torch.float32)
+
+    # Format B: flattened numeric CSV
+    numeric = df.select_dtypes(include=[np.number])
+    arr = numeric.values.flatten()
 
     expected = 5 * 180 * 1505
     if arr.size != expected:
         raise ValueError(
-            f"CSV numeric size mismatch. Expected {expected} values for shape [1,5,180,1505], got {arr.size}."
+            "Unsupported CSV format. Use either:\n"
+            "1) columns: time_idx, grid_id, 5 crime columns\n"
+            "2) flattened numeric CSV with exactly 5*180*1505 values."
         )
 
-    x = arr.reshape(1, 5, 180, 1505)
+    x = arr.astype(np.float32).reshape(1, 5, 180, 1505)
+    x = np.log1p(x)
     return torch.tensor(x, dtype=torch.float32)
 
 
 # =========================
-# Inference + postprocess
+# Inference / visualization
 # =========================
-def run_inference(model, x_tensor):
+def run_inference(model, x_tensor: torch.Tensor):
     with torch.no_grad():
-        y_pred = model(x_tensor)
-
-    if isinstance(y_pred, torch.Tensor):
-        y_pred = y_pred.detach().cpu().numpy()
-
-    return y_pred
+        pred_log = model(x_tensor).squeeze(2).cpu().numpy()[0]  # (C, N)
+    pred_count = np.expm1(pred_log)
+    pred_count = np.clip(pred_count, 0, None)
+    return pred_count.astype(np.float32)
 
 
-def normalize_output_shape(y_pred):
-    """
-    统一处理输出维度，尽量变成 [5, N]
-    这里只做宽松兼容。
-    """
-    y = np.array(y_pred)
-
-    if y.ndim == 4:
-        # [B, C, T, N]
-        y = y[0]
-        if y.shape[1] == 1:
-            y = y[:, 0, :]
-        else:
-            y = y[:, -1, :]
-    elif y.ndim == 3:
-        # [B, C, N]
-        y = y[0]
-    else:
-        raise ValueError(f"Unexpected output shape: {y.shape}")
-
-    return y  # [C, N]
+def get_grid_shape(meta: dict):
+    n_rows = int(meta.get("n_rows", 43))
+    n_cols = int(meta.get("n_cols", 35))
+    if n_rows * n_cols != int(meta["n_grids"]):
+        # fallback
+        return 43, 35
+    return n_rows, n_cols
 
 
-def plot_prediction_summary(y_2d, crime_labels):
-    total_by_type = y_2d.sum(axis=1)
-
-    pred_df = pd.DataFrame({
-        "Crime Type": crime_labels,
-        "Predicted Count": total_by_type
-    })
-
+def plot_prediction_summary(y_pred):
+    total_by_type = y_pred.sum(axis=1)
+    pred_df = pd.DataFrame({"Crime Type": CRIME_TYPES, "Predicted Count": total_by_type})
     fig = px.bar(pred_df, x="Crime Type", y="Predicted Count", color="Crime Type",
                  title="Predicted Crime Count by Type")
     st.plotly_chart(fig, use_container_width=True)
 
 
-def plot_prediction_heatmap(y_2d, selected_type_idx, crime_labels):
-    vec = y_2d[selected_type_idx]
+def plot_true_vs_pred_type_bar(y_pred, y_true):
+    pred_total = y_pred.sum(axis=1)
+    true_total = y_true.sum(axis=1)
 
-    # 尝试自动拼成近似方图
-    n = vec.shape[0]
-    side = int(np.sqrt(n))
-    if side * side == n:
-        grid_map = vec.reshape(side, side)
-    else:
-        # 如果不是完美平方，做 padding
-        side = int(np.ceil(np.sqrt(n)))
-        padded = np.zeros(side * side)
-        padded[:n] = vec
-        grid_map = padded.reshape(side, side)
+    df = pd.DataFrame({
+        "Crime Type": CRIME_TYPES * 2,
+        "Count": np.concatenate([true_total, pred_total]),
+        "Series": ["True"] * len(CRIME_TYPES) + ["Predicted"] * len(CRIME_TYPES),
+    })
+    fig = px.bar(df, x="Crime Type", y="Count", color="Series", barmode="group",
+                 title="True vs Predicted Total Count by Type")
+    st.plotly_chart(fig, use_container_width=True)
 
-    fig, ax = plt.subplots(figsize=(7, 6))
+
+def plot_hotspot_heatmap(vec, meta, title):
+    n_rows, n_cols = get_grid_shape(meta)
+    grid_map = vec.reshape(n_rows, n_cols)
+
+    fig, ax = plt.subplots(figsize=(8, 6))
     im = ax.imshow(grid_map)
-    ax.set_title(f"Predicted Hotspot Heatmap: {crime_labels[selected_type_idx]}")
+    ax.set_title(title)
     fig.colorbar(im, ax=ax, shrink=0.85)
     st.pyplot(fig, use_container_width=True)
 
 
-def plot_prediction_table(y_2d, crime_labels, top_k=20):
+def plot_top_grids(y_pred, top_k=20):
     rows = []
-    for i, ctype in enumerate(crime_labels):
-        vals = y_2d[i]
+    for i, ctype in enumerate(CRIME_TYPES):
+        vals = y_pred[i]
         top_idx = np.argsort(vals)[::-1][:top_k]
         for rank, idx in enumerate(top_idx, start=1):
             rows.append({
                 "Crime Type": ctype,
                 "Rank": rank,
                 "Grid Index": int(idx),
-                "Predicted Value": float(vals[idx])
+                "Predicted Value": float(vals[idx]),
             })
     out = pd.DataFrame(rows)
     st.dataframe(out, use_container_width=True)
 
 
-# =========================
-# Results / evaluation page
-# =========================
 def render_metrics_panel(art):
     st.subheader("Model Evaluation")
 
     metrics_overall = art.get("metrics_overall")
     metrics_compare = art.get("metrics_compare")
     split_info = art.get("split_info")
+    meta = art.get("meta")
 
     c1, c2, c3 = st.columns(3)
     if metrics_overall:
@@ -432,59 +480,76 @@ def render_metrics_panel(art):
         st.info(
             f"Lookback = {split_info['fields_used']['lookback']} steps, "
             f"Grids = {split_info['fields_used']['n_grids']}, "
-            f"Crime types = {split_info['fields_used']['n_types']}, "
-            f"Slots/day = {split_info['notes']['slots_per_day']}."
+            f"Crime types = {split_info['fields_used']['n_types']}."
+        )
+    elif meta:
+        st.info(
+            f"Lookback = {meta['lookback']} steps, "
+            f"Grids = {meta['n_grids']}, "
+            f"Crime types = {meta['n_types']}."
         )
 
     if metrics_compare:
-        st.write("Comparison against XGBoost reference:")
-        st.json(metrics_compare)
+        with st.expander("STGCN vs XGBoost comparison"):
+            st.json(metrics_compare)
 
     imgs = art.get("images", {})
-    show_list = [
+    ordered = [
         "metrics_by_crime_type.png",
         "accuracy_by_crime_type.png",
         "compare_stgcn_vs_xgboost.png",
         "loss_curve.png",
         "test_pred_vs_true_type0.png",
     ]
-    for name in show_list:
+    for name in ordered:
         if name in imgs:
-            st.image(imgs[name], caption=name)
+            st.image(str(imgs[name]), caption=name)
 
 
-def render_prediction_results(y_pred, art, source_name="Demo"):
+def render_prediction_results(y_pred, art, source_name, y_true=None, demo_info=None):
     st.subheader(f"Prediction Results ({source_name})")
+    plot_prediction_summary(y_pred)
 
-    crime_labels = ["THEFT", "BATTERY", "CRIMINAL DAMAGE", "ASSAULT", "DECEPTIVE PRACTICE"]
-    y_2d = normalize_output_shape(y_pred)
+    if demo_info is not None:
+        st.caption(
+            f"Demo anchor_t = {demo_info['anchor_t']}, "
+            f"target_t = {demo_info['target_t']}, "
+            f"lookback = {demo_info['lookback']}, "
+            f"horizon_slots = {demo_info['horizon_slots']}"
+        )
 
-    if y_2d.shape[0] != len(crime_labels):
-        st.warning(f"Expected 5 crime channels, got shape={y_2d.shape}. Please check output mapping.")
+    if y_true is not None:
+        plot_true_vs_pred_type_bar(y_pred, y_true)
 
-    plot_prediction_summary(y_2d, crime_labels)
+    meta = art["meta"]
+    crime_choice = st.selectbox("Select crime type for hotspot map", CRIME_TYPES, index=0)
+    type_idx = CRIME_TYPES.index(crime_choice)
 
-    type_choice = st.selectbox("Select crime type for hotspot view", crime_labels, index=0)
-    type_idx = crime_labels.index(type_choice)
-    plot_prediction_heatmap(y_2d, type_idx, crime_labels)
+    plot_hotspot_heatmap(y_pred[type_idx], meta, f"Predicted Hotspot Heatmap: {crime_choice}")
+    if y_true is not None:
+        plot_hotspot_heatmap(y_true[type_idx], meta, f"True Hotspot Heatmap: {crime_choice}")
 
     with st.expander("Top predicted grids"):
-        plot_prediction_table(y_2d, crime_labels, top_k=20)
+        plot_top_grids(y_pred, top_k=20)
 
     st.divider()
     render_metrics_panel(art)
 
 
 # =========================
-# EDA page
+# Page renderers
 # =========================
 def render_eda_page(art):
     st.header("EDA Dashboard")
 
-    needed = ["yearly", "monthly", "weekly", "daily", "top_types", "hourly_topN", "yearly_topN", "arrest_yearly", "arrest_yearly_topN", "grid"]
-    missing_files = [k for k in needed if art.get(k) is None]
-    if missing_files:
-        st.error(f"Missing required EDA artifacts: {missing_files}")
+    needed = [
+        "yearly", "monthly", "weekly", "daily",
+        "top_types", "hourly_topN", "yearly_topN",
+        "arrest_yearly", "arrest_yearly_topN", "grid"
+    ]
+    missing = [k for k in needed if art.get(k) is None]
+    if missing:
+        st.warning(f"Missing EDA artifacts: {missing}")
         return
 
     options = ["Time", "Category", "Location", "Arrest"]
@@ -561,7 +626,6 @@ def render_eda_page(art):
                 plot_gistar(grid)
 
     else:
-        st.caption("Combined view")
         t1, t2 = st.tabs(["Interactive overview", "Professional overview"])
         with t1:
             plot_year_trend(yearly)
@@ -574,36 +638,31 @@ def render_eda_page(art):
             plot_gistar(grid)
 
 
-# =========================
-# Prediction page
-# =========================
 def render_prediction_page(art):
-    st.header("STGCN Prediction Demo")
+    st.header("STGCN Prediction")
 
-    model, err = load_stgcn_model()
-    if err:
-        st.error(err)
-        st.stop()
-
-    mode = st.radio("Choose prediction input mode", ["Demo", "CSV Upload"], horizontal=True)
+    model = load_stgcn_model()
+    mode = st.radio("Choose input mode", ["Demo", "CSV Upload"], horizontal=True)
 
     if mode == "Demo":
-        st.write("Use a pre-saved demo tensor to run the model and display the result page.")
+        st.write("Run one real sample from the prepared tensor on the trained STGCN model.")
         if st.button("Run Demo Prediction"):
             try:
-                x_tensor = preprocess_demo_input()
+                x_tensor, y_true, info = make_demo_input(DEFAULT_HORIZON_SLOTS)
                 y_pred = run_inference(model, x_tensor)
-                render_prediction_results(y_pred, art, source_name="Demo")
+                render_prediction_results(y_pred, art, source_name="Demo", y_true=y_true, demo_info=info)
             except Exception as e:
                 st.error(f"Demo prediction failed: {e}")
 
         st.divider()
-        st.subheader("Evaluation Page")
-        st.write("Even without re-running, you can directly review the model evaluation figures below.")
+        st.subheader("Evaluation Preview")
         render_metrics_panel(art)
 
     else:
-        st.write("Upload a CSV and reuse the same result page and evaluation layout.")
+        st.write(
+            "Upload a prepared sequence CSV. Recommended schema:\n"
+            "`time_idx, grid_id, THEFT, BATTERY, CRIMINAL DAMAGE, ASSAULT, DECEPTIVE PRACTICE`"
+        )
         uploaded_file = st.file_uploader("Upload CSV for STGCN input", type=["csv"])
 
         if uploaded_file is not None:
@@ -616,13 +675,34 @@ def render_prediction_page(art):
                     x_tensor = preprocess_uploaded_csv(df)
                     y_pred = run_inference(model, x_tensor)
                     render_prediction_results(y_pred, art, source_name="CSV Upload")
-
             except Exception as e:
                 st.error(f"CSV prediction failed: {e}")
 
 
+def render_about_page(art):
+    st.header("About This App")
+    st.write(
+        """
+        This dashboard combines:
+        - EDA for Chicago crime data
+        - STGCN-based spatiotemporal forecasting
+        - Demo mode and CSV upload mode
+        - Static model evaluation artifacts
+        """
+    )
+    if art.get("meta"):
+        with st.expander("meta.json"):
+            st.json(art["meta"])
+    if art.get("split_info"):
+        with st.expander("split_info.json"):
+            st.json(art["split_info"])
+    if art.get("metrics_overall"):
+        with st.expander("metrics_overall.json"):
+            st.json(art["metrics_overall"])
+
+
 # =========================
-# Main app
+# Main
 # =========================
 def main():
     art = load_artifacts()
@@ -633,25 +713,10 @@ def main():
 
     if page == "EDA":
         render_eda_page(art)
-
     elif page == "Prediction":
         render_prediction_page(art)
-
     else:
-        st.header("About This App")
-        st.write("""
-        This dashboard combines:
-        - EDA for Chicago crime data
-        - STGCN-based spatio-temporal prediction
-        - Static evaluation figures and metrics
-        - Demo mode and CSV upload mode
-        """)
-
-        if art.get("split_info"):
-            st.json(art["split_info"])
-
-        if art.get("metrics_overall"):
-            st.json(art["metrics_overall"])
+        render_about_page(art)
 
 
 if __name__ == "__main__":
