@@ -4,4 +4,3 @@ numpy
 matplotlib
 plotly
 statsmodels
-torch==2.0.0
