@@ -1,5 +1,6 @@
 import json
 from pathlib import Path
+from datetime import datetime, timedelta
 
 import numpy as np
 import pandas as pd
@@ -22,12 +23,14 @@ FIG_DIR = APP_DIR / "figures"
 OUTPUT_DIR = APP_DIR / "outputs"
 
 LAT_COL, LON_COL = "Latitude", "Longitude"
-DEFAULT_HORIZON_SLOTS = 6
-CRIME_TYPES = ["THEFT", "BATTERY", "CRIMINAL DAMAGE", "ASSAULT", "DECEPTIVE PRACTICE"]
+CRIME_TYPES_DEFAULT = ["THEFT", "BATTERY", "CRIMINAL DAMAGE", "ASSAULT", "DECEPTIVE PRACTICE"]
 
-st.set_page_config(page_title="Chicago Crime Analytics + STGCN (ONNX)", layout="wide")
+# 未来预测天数
+FORECAST_DAYS = 30
+
+st.set_page_config(page_title="Chicago Crime Analytics + STGCN Forecast", layout="wide")
 st.title("Chicago Crime Analytics and STGCN Prediction Dashboard")
-st.caption("EDA + ONNX-based spatiotemporal forecasting app")
+st.caption("EDA + ONNX spatiotemporal forecasting + calendar-based EVA")
 
 
 # =========================
@@ -160,8 +163,14 @@ def plot_top_types(df_):
 
 
 def plot_hourly_by_type(df_):
-    fig = px.line(df_, x="Hour", y="Total_Crimes", color="Primary Type", markers=True,
-                  title="Hourly Crime Pattern by Type")
+    fig = px.line(
+        df_,
+        x="Hour",
+        y="Total_Crimes",
+        color="Primary Type",
+        markers=True,
+        title="Hourly Crime Pattern by Type",
+    )
     st.plotly_chart(fig, use_container_width=True)
 
 
@@ -187,8 +196,14 @@ def plot_arrest_rate(df_):
 def plot_arrest_rate_by_type(df_):
     tmp = df_.copy()
     tmp["Arrest_Rate_%"] = tmp["Arrest_Rate"] * 100
-    fig = px.line(tmp, x="Year", y="Arrest_Rate_%", color="Primary Type", markers=True,
-                  title="Arrest Rate by Crime Type")
+    fig = px.line(
+        tmp,
+        x="Year",
+        y="Arrest_Rate_%",
+        color="Primary Type",
+        markers=True,
+        title="Arrest Rate by Crime Type",
+    )
     st.plotly_chart(fig, use_container_width=True)
 
 
@@ -262,154 +277,163 @@ def load_onnx_session():
     if not onnx_path.exists():
         raise FileNotFoundError(f"Missing ONNX model: {onnx_path}")
 
-    session = ort.InferenceSession(
-        str(onnx_path),
-        providers=["CPUExecutionProvider"]
-    )
+    session = ort.InferenceSession(str(onnx_path), providers=["CPUExecutionProvider"])
     return session
 
 
 # =========================
-# Prediction preprocess
+# Tensor / meta loading
 # =========================
 @st.cache_data
 def load_tensor_and_meta():
     meta = safe_read_json(DATA_DIR / "meta.json")
-    tensor_path = first_existing(DATA_DIR / "demo_tensor.npy", DATA_DIR / "tensor.npy")
+    tensor_path = first_existing(DATA_DIR / "tensor.npy", DATA_DIR / "demo_tensor.npy")
     if tensor_path is None:
-        raise FileNotFoundError("Neither demo_tensor.npy nor tensor.npy was found in artifacts/data_v2/")
+        raise FileNotFoundError("Neither tensor.npy nor demo_tensor.npy was found in artifacts/data_v2/")
     tensor = np.load(tensor_path, mmap_mode="r")
     return tensor, meta
 
 
-def make_demo_input(horizon_slots: int = DEFAULT_HORIZON_SLOTS):
-    tensor, meta = load_tensor_and_meta()
-
-    lookback = int(meta["lookback"])
-    val_end = int(meta.get("val_end", lookback))
-
-    anchor_t = max(val_end, lookback)
-
-    target_t = anchor_t + horizon_slots
-    if target_t >= tensor.shape[0]:
-        target_t = tensor.shape[0] - 1
-
-    x = np.asarray(tensor[anchor_t - lookback: anchor_t], dtype=np.float32)
-    y_true = np.asarray(tensor[target_t], dtype=np.float32)
-
-    x = np.transpose(x, (2, 0, 1))
-    x = np.log1p(x)
-    x = np.expand_dims(x, 0)
-
-    y_true = np.transpose(y_true, (1, 0))
-
-    return x, y_true, {"anchor_t": anchor_t}
+def get_slots_per_day(meta: dict) -> int:
+    return int(meta.get("slots_per_day", 6)) if meta else 6
 
 
-def preprocess_uploaded_csv(df: pd.DataFrame):
-    """
-    Format A:
-      columns = [time_idx, grid_id, THEFT, BATTERY, CRIMINAL DAMAGE, ASSAULT, DECEPTIVE PRACTICE]
+def get_model_lookback_steps(meta: dict) -> int:
+    # 优先取预处理里保存的 lookback_steps
+    if meta and "lookback_steps" in meta:
+        return int(meta["lookback_steps"])
 
-    Format B:
-      a flattened numeric CSV containing exactly 5 * 180 * 1505 values
-    """
-    required_cols = {"time_idx", "grid_id", *CRIME_TYPES}
+    # 兼容旧 meta
+    if meta and "lookback" in meta:
+        return int(meta["lookback"])
 
-    if required_cols.issubset(df.columns):
-        tmp = df.copy()
+    # 兜底：你当前 ONNX 模型固定输入要求
+    return 180
 
-        tmp["time_idx"] = pd.to_numeric(tmp["time_idx"], errors="raise").astype(int)
-        tmp["grid_id"] = pd.to_numeric(tmp["grid_id"], errors="raise").astype(int)
 
-        if tmp["time_idx"].min() != 0 or tmp["time_idx"].max() != 179:
-            raise ValueError("time_idx must span exactly 0..179.")
-        if tmp["grid_id"].min() != 0 or tmp["grid_id"].max() != 1504:
-            raise ValueError("grid_id must span exactly 0..1504.")
-
-        expected_rows = 180 * 1505
-        if len(tmp) != expected_rows:
-            raise ValueError(f"Expected {expected_rows} rows, got {len(tmp)}.")
-
-        tmp = tmp.sort_values(["time_idx", "grid_id"]).reset_index(drop=True)
-
-        for c in CRIME_TYPES:
-            tmp[c] = pd.to_numeric(tmp[c], errors="raise").astype(np.float32)
-
-        values = tmp[CRIME_TYPES].values.reshape(180, 1505, 5)  # (L, N, C)
-        x = np.transpose(values, (2, 0, 1))                     # (C, L, N)
-        x = np.log1p(x)
-        x = np.expand_dims(x, 0)                                # (1, C, L, N)
-
-        return x.astype(np.float32)
-
-    numeric = df.select_dtypes(include=[np.number])
-    arr = numeric.values.flatten()
-
-    expected = 5 * 180 * 1505
-    if arr.size != expected:
-        raise ValueError(
-            "Unsupported CSV format. Use either:\n"
-            "1) columns: time_idx, grid_id, 5 crime columns\n"
-            "2) flattened numeric CSV with exactly 5*180*1505 values."
-        )
-
-    x = arr.astype(np.float32).reshape(1, 5, 180, 1505)
-    x = np.log1p(x)
-    return x.astype(np.float32)
+def get_crime_types(meta: dict):
+    if meta and "crime_types" in meta and isinstance(meta["crime_types"], list):
+        return meta["crime_types"]
+    return CRIME_TYPES_DEFAULT
 
 
 # =========================
-# Inference / visualization
+# Prediction helpers
 # =========================
 def run_inference(session, x_array: np.ndarray):
     input_name = session.get_inputs()[0].name
     output_name = session.get_outputs()[0].name
 
-    pred = session.run([output_name], {input_name: x_array})[0]
+    pred = session.run([output_name], {input_name: x_array.astype(np.float32)})[0]
     pred = np.asarray(pred)
 
-    # 兼容导出后常见形状
-    if pred.ndim == 4:
-        pred = np.squeeze(pred, axis=2) if pred.shape[2] == 1 else pred
+    # 兼容常见导出形状
+    if pred.ndim == 4 and pred.shape[2] == 1:
+        pred = np.squeeze(pred, axis=2)
     if pred.ndim == 3:
         pred = pred[0]
 
-    if pred.shape != (5, 1505):
-        raise ValueError(f"Unexpected ONNX output shape: {pred.shape}")
+    # 预期: (C, N)
+    if pred.ndim != 2:
+        raise ValueError(f"Unexpected ONNX output ndim: {pred.ndim}, shape={pred.shape}")
 
     pred_count = np.expm1(pred)
     pred_count = np.clip(pred_count, 0, None)
     return pred_count.astype(np.float32)
 
 
+def prepare_model_input(window_lnc: np.ndarray) -> np.ndarray:
+    """
+    window_lnc: (L, N, C)
+    return: (1, C, L, N)
+    """
+    x = np.asarray(window_lnc, dtype=np.float32)
+    x = np.transpose(x, (2, 0, 1))   # (C, L, N)
+    x = np.log1p(x)
+    x = np.expand_dims(x, 0)         # (1, C, L, N)
+    return x.astype(np.float32)
+
+
+def recursive_forecast_daily(session, tensor, meta, forecast_days=FORECAST_DAYS):
+    """
+    tensor: (T, N, C)
+    输出:
+      daily_preds: (forecast_days, C, N)
+      info: dict
+    """
+    slots_per_day = get_slots_per_day(meta)
+    lookback_steps = get_model_lookback_steps(meta)
+
+    if tensor.shape[0] < lookback_steps:
+        raise ValueError(
+            f"Tensor has only {tensor.shape[0]} steps, but model needs {lookback_steps} lookback steps."
+        )
+
+    horizon_steps = forecast_days * slots_per_day
+
+    # 用最后 lookback_steps 作为输入窗口
+    window = np.asarray(tensor[-lookback_steps:], dtype=np.float32)  # (L, N, C)
+    step_preds = []
+
+    for _ in range(horizon_steps):
+        x_input = prepare_model_input(window)        # (1, C, L, N)
+        y_pred = run_inference(session, x_input)     # (C, N)
+        step_preds.append(y_pred)
+
+        next_step = np.transpose(y_pred, (1, 0))     # (N, C)
+        window = np.concatenate([window[1:], next_step[None, :, :]], axis=0)
+
+    step_preds = np.asarray(step_preds, dtype=np.float32)  # (H, C, N)
+    daily_preds = step_preds.reshape(forecast_days, slots_per_day, step_preds.shape[1], step_preds.shape[2]).sum(axis=1)
+
+    info = {
+        "lookback_steps": lookback_steps,
+        "slots_per_day": slots_per_day,
+        "forecast_days": forecast_days,
+        "horizon_steps": horizon_steps,
+        "tensor_steps": int(tensor.shape[0]),
+    }
+    return daily_preds, info
+
+
+@st.cache_data
+def precompute_daily_predictions(forecast_days=FORECAST_DAYS):
+    tensor, meta = load_tensor_and_meta()
+    session = load_onnx_session()
+    daily_preds, info = recursive_forecast_daily(session, tensor, meta, forecast_days=forecast_days)
+    return daily_preds, meta, info
+
+
+def build_forecast_dates(meta: dict, forecast_days=FORECAST_DAYS):
+    """
+    从 meta 里的 end_date 往后推。
+    如果没有 end_date，就从今天开始。
+    """
+    if meta and "end_date" in meta:
+        last_real_day = pd.Timestamp(meta["end_date"])
+        start_day = last_real_day + pd.Timedelta(days=1)
+    else:
+        start_day = pd.Timestamp(datetime.today().date())
+
+    return [start_day + pd.Timedelta(days=i) for i in range(forecast_days)]
+
+
+# =========================
+# Visualization
+# =========================
 def get_grid_shape(meta: dict):
     n_rows = int(meta.get("n_rows", 43))
     n_cols = int(meta.get("n_cols", 35))
-    if n_rows * n_cols != int(meta["n_grids"]):
+    if meta and "n_grids" in meta and n_rows * n_cols != int(meta["n_grids"]):
         return 43, 35
     return n_rows, n_cols
 
 
-def plot_prediction_summary(y_pred):
+def plot_prediction_summary(y_pred, crime_types):
     total_by_type = y_pred.sum(axis=1)
-    pred_df = pd.DataFrame({"Crime Type": CRIME_TYPES, "Predicted Count": total_by_type})
+    pred_df = pd.DataFrame({"Crime Type": crime_types, "Predicted Count": total_by_type})
     fig = px.bar(pred_df, x="Crime Type", y="Predicted Count", color="Crime Type",
-                 title="Predicted Crime Count by Type")
-    st.plotly_chart(fig, use_container_width=True)
-
-
-def plot_true_vs_pred_type_bar(y_pred, y_true):
-    pred_total = y_pred.sum(axis=1)
-    true_total = y_true.sum(axis=1)
-
-    df = pd.DataFrame({
-        "Crime Type": CRIME_TYPES * 2,
-        "Count": np.concatenate([true_total, pred_total]),
-        "Series": ["True"] * len(CRIME_TYPES) + ["Predicted"] * len(CRIME_TYPES),
-    })
-    fig = px.bar(df, x="Crime Type", y="Count", color="Series", barmode="group",
-                 title="True vs Predicted Total Count by Type")
+                 title="Predicted Daily Crime Count by Type")
     st.plotly_chart(fig, use_container_width=True)
 
 
@@ -424,9 +448,9 @@ def plot_hotspot_heatmap(vec, meta, title):
     st.pyplot(fig, use_container_width=True)
 
 
-def plot_top_grids(y_pred, top_k=20):
+def plot_top_grids(y_pred, crime_types, top_k=20):
     rows = []
-    for i, ctype in enumerate(CRIME_TYPES):
+    for i, ctype in enumerate(crime_types):
         vals = y_pred[i]
         top_idx = np.argsort(vals)[::-1][:top_k]
         for rank, idx in enumerate(top_idx, start=1):
@@ -462,7 +486,7 @@ def render_metrics_panel(art):
         )
     elif meta:
         st.info(
-            f"Lookback = {meta.get('lookback', 'NA')} steps, "
+            f"Tensor steps = {meta.get('n_steps', 'NA')}, "
             f"Grids = {meta.get('n_grids', 'NA')}, "
             f"Crime types = {meta.get('n_types', 'NA')}."
         )
@@ -484,31 +508,19 @@ def render_metrics_panel(art):
             st.image(str(imgs[name]), caption=name)
 
 
-def render_prediction_results(y_pred, art, source_name, y_true=None, demo_info=None):
-    st.subheader(f"Prediction Results ({source_name})")
-    plot_prediction_summary(y_pred)
+def render_prediction_results(y_pred, art, source_name, crime_types):
+    st.subheader(source_name)
 
-    if demo_info is not None:
-        st.caption(
-            f"Demo anchor_t = {demo_info['anchor_t']}, "
-            f"target_t = {demo_info['target_t']}, "
-            f"lookback = {demo_info['lookback']}, "
-            f"horizon_slots = {demo_info['horizon_slots']}"
-        )
+    plot_prediction_summary(y_pred, crime_types)
 
-    if y_true is not None:
-        plot_true_vs_pred_type_bar(y_pred, y_true)
+    meta = art["meta"] if art.get("meta") else {}
+    crime_choice = st.selectbox("Select crime type for hotspot map", crime_types, index=0)
+    type_idx = crime_types.index(crime_choice)
 
-    meta = art["meta"]
-    crime_choice = st.selectbox("Select crime type for hotspot map", CRIME_TYPES, index=0)
-    type_idx = CRIME_TYPES.index(crime_choice)
-
-    plot_hotspot_heatmap(y_pred[type_idx], meta, f"Predicted Hotspot Heatmap: {crime_choice}")
-    if y_true is not None:
-        plot_hotspot_heatmap(y_true[type_idx], meta, f"True Hotspot Heatmap: {crime_choice}")
+    plot_hotspot_heatmap(y_pred[type_idx], meta, f"Predicted Daily Hotspot: {crime_choice}")
 
     with st.expander("Top predicted grids"):
-        plot_top_grids(y_pred, top_k=20)
+        plot_top_grids(y_pred, crime_types, top_k=20)
 
     st.divider()
     render_metrics_panel(art)
@@ -617,49 +629,48 @@ def render_eda_page(art):
 
 
 def render_prediction_page(art):
-    st.header("STGCN Prediction (ONNX)")
+    st.header("Forecast Calendar")
 
     try:
-        session = load_onnx_session()
+        daily_preds, meta, info = precompute_daily_predictions(FORECAST_DAYS)
     except Exception as e:
-        st.error(f"Failed to load ONNX model: {e}")
+        st.error(f"Failed to precompute future predictions: {e}")
         return
 
-    mode = st.radio("Choose input mode", ["Demo", "CSV Upload"], horizontal=True)
+    crime_types = get_crime_types(meta)
+    forecast_dates = build_forecast_dates(meta, FORECAST_DAYS)
 
-    if mode == "Demo":
-        st.write("Run one prepared sample on the exported ONNX STGCN model.")
-        if st.button("Run Demo Prediction"):
-            try:
-                x_array, y_true, info = make_demo_input(DEFAULT_HORIZON_SLOTS)
-                y_pred = run_inference(session, x_array)
-                render_prediction_results(y_pred, art, source_name="Demo", y_true=y_true, demo_info=info)
-            except Exception as e:
-                st.error(f"Demo prediction failed: {e}")
+    st.info(
+        f"Using the latest {info['lookback_steps']} time steps as model input, "
+        f"rolling forward {info['forecast_days']} days "
+        f"({info['horizon_steps']} slot-level forecasts aggregated to daily results)."
+    )
 
-        st.divider()
-        st.subheader("Evaluation Preview")
-        render_metrics_panel(art)
+    # 日期选择
+    date_options = list(range(len(forecast_dates)))
+    selected_idx = st.selectbox(
+        "Select forecast date",
+        options=date_options,
+        format_func=lambda i: pd.Timestamp(forecast_dates[i]).strftime("%Y-%m-%d"),
+    )
 
-    else:
-        st.write(
-            "Upload a prepared sequence CSV. Recommended schema:\n"
-            "`time_idx, grid_id, THEFT, BATTERY, CRIMINAL DAMAGE, ASSAULT, DECEPTIVE PRACTICE`"
-        )
-        uploaded_file = st.file_uploader("Upload CSV for STGCN input", type=["csv"])
+    selected_date = pd.Timestamp(forecast_dates[selected_idx])
+    selected_pred = daily_preds[selected_idx]  # (C, N)
 
-        if uploaded_file is not None:
-            try:
-                df = pd.read_csv(uploaded_file)
-                st.subheader("Uploaded CSV Preview")
-                st.dataframe(df.head(), use_container_width=True)
+    # 日期条
+    with st.expander("Available forecast window"):
+        df_dates = pd.DataFrame({
+            "Index": np.arange(len(forecast_dates)),
+            "Date": [pd.Timestamp(d).strftime("%Y-%m-%d") for d in forecast_dates]
+        })
+        st.dataframe(df_dates, use_container_width=True, hide_index=True)
 
-                if st.button("Run CSV Prediction"):
-                    x_array = preprocess_uploaded_csv(df)
-                    y_pred = run_inference(session, x_array)
-                    render_prediction_results(y_pred, art, source_name="CSV Upload")
-            except Exception as e:
-                st.error(f"CSV prediction failed: {e}")
+    render_prediction_results(
+        selected_pred,
+        art,
+        source_name=f"Predicted crime distribution for {selected_date.strftime('%Y-%m-%d')}",
+        crime_types=crime_types
+    )
 
 
 def render_about_page(art):
@@ -669,7 +680,7 @@ def render_about_page(art):
         This dashboard combines:
         - EDA for Chicago crime data
         - ONNX-based STGCN forecasting
-        - Demo mode and CSV upload mode
+        - Calendar-based future daily prediction
         - Static model evaluation artifacts
         """
     )
@@ -692,11 +703,11 @@ def main():
 
     with st.sidebar:
         st.header("Navigation")
-        page = st.radio("Go to", ["EDA", "Prediction", "About"])
+        page = st.radio("Go to", ["EDA", "Forecast", "About"])
 
     if page == "EDA":
         render_eda_page(art)
-    elif page == "Prediction":
+    elif page == "Forecast":
         render_prediction_page(art)
     else:
         render_about_page(art)
