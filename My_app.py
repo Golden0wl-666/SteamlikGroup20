@@ -287,32 +287,23 @@ def make_demo_input(horizon_slots: int = DEFAULT_HORIZON_SLOTS):
 
     lookback = int(meta["lookback"])
     val_end = int(meta.get("val_end", lookback))
-    n_steps = int(meta.get("n_steps", tensor.shape[0]))
 
-    anchor_t = val_end
-    if anchor_t < lookback:
-        anchor_t = lookback
+    anchor_t = max(val_end, lookback)
 
     target_t = anchor_t + horizon_slots
     if target_t >= tensor.shape[0]:
         target_t = tensor.shape[0] - 1
 
-    x = np.asarray(tensor[anchor_t - lookback: anchor_t], dtype=np.float32)   # (L, N, C)
-    y_true = np.asarray(tensor[target_t], dtype=np.float32)                    # (N, C)
+    x = np.asarray(tensor[anchor_t - lookback: anchor_t], dtype=np.float32)
+    y_true = np.asarray(tensor[target_t], dtype=np.float32)
 
-    x = np.transpose(x, (2, 0, 1))   # (C, L, N)
+    x = np.transpose(x, (2, 0, 1))
     x = np.log1p(x)
-    x = np.expand_dims(x, 0)         # (1, C, L, N)
+    x = np.expand_dims(x, 0)
 
-    y_true = np.transpose(y_true, (1, 0))  # (C, N)
+    y_true = np.transpose(y_true, (1, 0))
 
-    info = {
-        "anchor_t": anchor_t,
-        "target_t": target_t,
-        "lookback": lookback,
-        "horizon_slots": horizon_slots,
-    }
-    return x.astype(np.float32), y_true.astype(np.float32), info
+    return x, y_true, {"anchor_t": anchor_t}
 
 
 def preprocess_uploaded_csv(df: pd.DataFrame):
