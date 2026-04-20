@@ -12,9 +12,6 @@ import onnxruntime as ort
 from pandas.tseries.holiday import USFederalHolidayCalendar
 
 
-# =========================
-# Paths / constants
-# =========================
 APP_DIR = Path(__file__).resolve().parent
 ART_DIR = APP_DIR / "artifacts"
 DATA_DIR = ART_DIR / "data_v2"
@@ -24,8 +21,6 @@ OUTPUT_DIR = APP_DIR / "outputs"
 
 LAT_COL, LON_COL = "Latitude", "Longitude"
 CRIME_TYPES_DEFAULT = ["THEFT", "BATTERY", "CRIMINAL DAMAGE", "ASSAULT", "DECEPTIVE PRACTICE"]
-
-# 未来预测天数
 FORECAST_DAYS = 30
 
 st.set_page_config(page_title="Chicago Crime Analytics + STGCN Forecast", layout="wide")
@@ -33,9 +28,6 @@ st.title("Chicago Crime Analytics and STGCN Prediction Dashboard")
 st.caption("EDA + ONNX spatiotemporal forecasting + calendar-based EVA")
 
 
-# =========================
-# Generic helpers
-# =========================
 def first_existing(*paths: Path):
     for p in paths:
         if p.exists():
@@ -53,10 +45,6 @@ def safe_read_json(path: Path):
             return json.load(f)
     return None
 
-
-# =========================
-# Artifact loading
-# =========================
 @st.cache_data
 def load_artifacts():
     art = {}
@@ -74,7 +62,6 @@ def load_artifacts():
     art["grid"] = safe_read_csv(ART_DIR / "spatial_grid_precomputed.csv")
     art["points"] = safe_read_csv(ART_DIR / "sample_points.csv")
 
-    # Metrics / metadata
     art["metrics_overall"] = safe_read_json(
         first_existing(APP_DIR / "metrics_overall.json", ART_DIR / "metrics_overall.json")
     )
@@ -85,10 +72,8 @@ def load_artifacts():
         first_existing(OUTPUT_DIR / "split_info.json", APP_DIR / "split_info.json", ART_DIR / "split_info.json")
     )
 
-    # Data_v2 meta
     art["meta"] = safe_read_json(DATA_DIR / "meta.json")
 
-    # Images
     art["images"] = {}
     image_names = [
         "metrics_by_crime_type.png",
@@ -102,7 +87,6 @@ def load_artifacts():
         if p:
             art["images"][name] = p
 
-    # Cleanup
     if art["daily"] is not None and "Date" in art["daily"].columns:
         art["daily"]["Date"] = pd.to_datetime(art["daily"]["Date"], errors="coerce")
         art["daily"] = art["daily"].dropna(subset=["Date"]).sort_values("Date")
@@ -264,9 +248,6 @@ def plot_location_map(points_df, year_range, crime_filter):
     st.plotly_chart(fig, use_container_width=True)
 
 
-# =========================
-# ONNX loading
-# =========================
 @st.cache_resource
 def load_onnx_session():
     onnx_path = MODEL_DIR / "stgcn_best.onnx"
@@ -276,10 +257,6 @@ def load_onnx_session():
     session = ort.InferenceSession(str(onnx_path), providers=["CPUExecutionProvider"])
     return session
 
-
-# =========================
-# Tensor / meta loading
-# =========================
 @st.cache_data
 def load_tensor_and_meta(mode="Demo"):
     meta = safe_read_json(DATA_DIR / "meta.json")
@@ -618,10 +595,6 @@ def render_prediction_page(art):
     except Exception as e:
         st.error(f"Failed to precompute future predictions: {e}")
         return
-
-    if st.sidebar.button("Clear cached predictions"):
-    st.cache_data.clear()
-    st.rerun()
 
     crime_types = get_crime_types(meta)
     forecast_dates = build_forecast_dates(meta, FORECAST_DAYS)
