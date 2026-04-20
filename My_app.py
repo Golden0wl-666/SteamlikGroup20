@@ -285,11 +285,17 @@ def load_onnx_session():
 # Tensor / meta loading
 # =========================
 @st.cache_data
-def load_tensor_and_meta():
+def load_tensor_and_meta(mode="Demo"):
     meta = safe_read_json(DATA_DIR / "meta.json")
-    tensor_path = first_existing(DATA_DIR / "tensor.npy", DATA_DIR / "demo_tensor.npy")
-    if tensor_path is None:
-        raise FileNotFoundError("Neither tensor.npy nor demo_tensor.npy was found in artifacts/data_v2/")
+
+    if mode == "Demo":
+        tensor_path = DATA_DIR / "demo_tensor.npy"
+    else:
+        tensor_path = DATA_DIR / "tensor.npy"
+
+    if not tensor_path.exists():
+        raise FileNotFoundError(f"Missing tensor file: {tensor_path}")
+
     tensor = np.load(tensor_path, mmap_mode="r")
     return tensor, meta
 
@@ -397,8 +403,8 @@ def recursive_forecast_daily(session, tensor, meta, forecast_days=FORECAST_DAYS)
 
 
 @st.cache_data
-def precompute_daily_predictions(forecast_days=FORECAST_DAYS):
-    tensor, meta = load_tensor_and_meta()
+def precompute_daily_predictions(mode, forecast_days=FORECAST_DAYS):
+    tensor, meta = load_tensor_and_meta(mode)
     session = load_onnx_session()
     daily_preds, info = recursive_forecast_daily(session, tensor, meta, forecast_days=forecast_days)
     return daily_preds, meta, info
