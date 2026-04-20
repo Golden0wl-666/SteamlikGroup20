@@ -1,3 +1,5 @@
+import os
+import requests
 import json
 from pathlib import Path
 from datetime import datetime
@@ -11,6 +13,38 @@ import onnxruntime as ort
 
 from pandas.tseries.holiday import USFederalHolidayCalendar
 
+API_BASE = (
+    st.secrets.get("CRIME_API_URL", None)
+    or os.environ.get("CRIME_API_URL", "http://127.0.0.1:8000")
+)
+
+SLOT_LABELS = [
+    "00:00–03:59",
+    "04:00–07:59",
+    "08:00–11:59",
+    "12:00–15:59",
+    "16:00–19:59",
+    "20:00–23:59",
+]
+
+
+@st.cache_data(ttl=600)
+def api_metadata():
+    resp = requests.get(f"{API_BASE}/metadata", timeout=30)
+    resp.raise_for_status()
+    return resp.json()
+
+
+@st.cache_data(ttl=600)
+def api_predict(day_index: int, slot_index: int | None, aggregate: str):
+    payload = {
+        "day_index": day_index,
+        "slot_index": slot_index,
+        "aggregate": aggregate,
+    }
+    resp = requests.post(f"{API_BASE}/predict", json=payload, timeout=60)
+    resp.raise_for_status()
+    return resp.json()
 
 
 APP_DIR = Path(__file__).resolve().parent
@@ -393,13 +427,12 @@ def precompute_predictions(forecast_days=FORECAST_DAYS):
     return slot_preds, daily_preds, meta, info
 
 
-def build_forecast_dates(meta: dict, forecast_days=FORECAST_DAYS):
-    if meta and "end_date" in meta:
-        last_real_day = pd.Timestamp(meta["end_date"])
-        start_day = last_real_day + pd.Timedelta(days=1)
+def build_forecast_dates(meta: dict):
+    forecast_days = int(meta["forecast_days"])
+    if meta.get("end_date"):
+        start_day = pd.Timestamp(meta["end_date"]) + pd.Timedelta(days=1)
     else:
-        start_day = pd.Timestamp(datetime.today().date())
-
+        start_day = pd.Timestamp.today().normalize()
     return [start_day + pd.Timedelta(days=i) for i in range(forecast_days)]
 
 
@@ -418,8 +451,8 @@ def plot_prediction_summary(y_pred, crime_types, title="Predicted Crime Count by
     st.plotly_chart(fig, use_container_width=True)
 
 
-def plot_hotspot_heatmap(vec, meta, title):
-    n_rows, n_cols = get_grid_shape(meta)
+def plot_hotspot_heatmap(vec, n_rows, n_cols, title):
+    import matplotlib.pyplot as plt
     grid_map = vec.reshape(n_rows, n_cols)
 
     fig, ax = plt.subplots(figsize=(8, 6))
@@ -544,13 +577,13 @@ def render_slot_prediction_results(y_pred, art, source_name, crime_types):
     col1, col2 = st.columns([1.15, 1])
 
     with col1:
-        plot_prediction_summary(y_pred, crime_types, title="Predicted 4H Crime Count by Type")
+        plot_prediction_summary(y_pred, crime_types, title=f"Predicted Crime Count by Type | {selected_date} | {selected_slot_label}")
 
     with col2:
         meta = art["meta"] if art.get("meta") else {}
         crime_choice = st.selectbox("Select crime type for hotspot map", crime_types, index=0, key="slot_crime_choice")
         type_idx = crime_types.index(crime_choice)
-        plot_hotspot_heatmap(y_pred[type_idx], meta, f"Predicted 4H Hotspot: {crime_choice}")
+        plot_hotspot_heatmap(y_pred[type_idx], meta, title=f"Predicted Hotspot: {crime_choice} | {selected_date} | {selected_slot_label}")
 
     with st.expander("Top predicted grids in current 4H slice"):
         plot_top_grids(y_pred, crime_types, top_k=20)
@@ -654,25 +687,23 @@ def render_eda_page(art):
             plot_gistar(grid)
 
 
-def render_forecast_page(art):
+def render_forecast_page():
     st.header("Forecast Calendar")
 
     try:
-        slot_preds, daily_preds, meta, info = precompute_predictions(FORECAST_DAYS)
+        meta = api_metadata()
     except Exception as e:
-        st.error(f"Failed to precompute future predictions: {e}")
+        st.error(f"Failed to connect to backend API: {e}")
         return
 
-    crime_types = get_crime_types(meta)
-    forecast_dates = build_forecast_dates(meta, FORECAST_DAYS)
-    slots_per_day = info["slots_per_day"]
+    crime_types = meta["crime_types"]
+    slots_per_day = meta["slots_per_day"]
+    forecast_dates = build_forecast_dates_from_meta(meta)
     slot_labels = SLOT_LABELS[:slots_per_day]
 
     st.info(
-        f"Using the latest {info['lookback_steps']} time steps as model input, "
-        f"rolling forward {info['forecast_days']} days "
-        f"({info['horizon_steps']} slot-level forecasts). "
-        f"The main display below is based on 4-hour slices."
+        "Predictions are now served by the FastAPI backend. "
+        "The frontend only requests the selected day / 4-hour slice."
     )
 
     day_col, slot_col = st.columns([1.2, 1])
@@ -689,61 +720,46 @@ def render_forecast_page(art):
             "Select 4-hour slot",
             options=list(range(slots_per_day)),
             format_func=lambda i: slot_labels[i],
-            horizontal=True
+            horizontal=True,
         )
 
-    selected_date = pd.Timestamp(forecast_dates[selected_day_idx])
-    selected_slot_pred = slot_preds[selected_day_idx, selected_slot_idx] 
-    selected_daily_pred = daily_preds[selected_day_idx]
-    selected_day_slots = slot_preds[selected_day_idx] 
+    selected_date = pd.Timestamp(forecast_dates[selected_day_idx]).strftime("%Y-%m-%d")
+    selected_slot_label = slot_labels[selected_slot_idx]
 
-    with st.expander("Available forecast window"):
-        plot_forecast_window_table(forecast_dates)
+    try:
+        slot_resp = api_predict(selected_day_idx, selected_slot_idx, "slot")
+        day_resp = api_predict(selected_day_idx, None, "day")
+    except Exception as e:
+        st.error(f"Prediction request failed: {e}")
+        return
 
-    st.subheader(f"Forecast for {selected_date.strftime('%Y-%m-%d')}")
+    selected_slot_pred = np.array(slot_resp["values"], dtype=np.float32)
+    selected_day_pred = np.array(day_resp["values"], dtype=np.float32)
 
-    top_left, top_right = st.columns([1, 1])
+    st.subheader(f"Forecast for {selected_date} | {selected_slot_label}")
 
-    with top_left:
-        plot_intraday_total(selected_day_slots, slot_labels)
-
-    with top_right:
-        plot_intraday_by_crime(selected_day_slots, crime_types, slot_labels)
-
-    st.divider()
-
-    render_slot_prediction_results(
+    plot_prediction_summary(
         selected_slot_pred,
-        art,
-        source_name=f"Selected 4H slice: {selected_date.strftime('%Y-%m-%d')} | {slot_labels[selected_slot_idx]}",
-        crime_types=crime_types,
+        crime_types,
+        title=f"Predicted Crime Count by Type | {selected_date} | {selected_slot_label}"
     )
 
-    st.divider()
-    st.subheader("Daily aggregate reference")
+    crime_choice = st.selectbox("Select crime type for hotspot map", crime_types, index=0)
+    type_idx = crime_types.index(crime_choice)
+    
+    plot_hotspot_heatmap_api(
+        selected_slot_pred[type_idx],
+        n_rows=slot_resp["n_rows"],
+        n_cols=slot_resp["n_cols"],
+        title=f"Predicted Hotspot: {crime_choice} | {selected_date} | {selected_slot_label}"
+    )
 
-    ref_col1, ref_col2 = st.columns([1.15, 1])
-
-    with ref_col1:
-        plot_prediction_summary(selected_daily_pred, crime_types, title="Daily Aggregate Crime Count by Type")
-
-    with ref_col2:
-        meta_local = art["meta"] if art.get("meta") else {}
-        daily_crime_choice = st.selectbox(
-            "Select crime type for daily hotspot reference",
+    with st.expander("Daily aggregate reference"):
+        plot_prediction_summary(
+            selected_day_pred,
             crime_types,
-            index=0,
-            key="daily_crime_choice"
+            title=f"Daily Aggregate Crime Count by Type | {selected_date}"
         )
-        daily_type_idx = crime_types.index(daily_crime_choice)
-        plot_hotspot_heatmap(
-            selected_daily_pred[daily_type_idx],
-            meta_local,
-            f"Daily Aggregate Hotspot: {daily_crime_choice}"
-        )
-
-    with st.expander("Top predicted grids in daily aggregate"):
-        plot_top_grids(selected_daily_pred, crime_types, top_k=20)
 
 
 def render_about_page(art):
