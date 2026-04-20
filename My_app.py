@@ -115,10 +115,6 @@ def load_artifacts():
 
     return art
 
-
-# =========================
-# EDA helpers
-# =========================
 def filter_year(df: pd.DataFrame, year_range):
     if df is None or "Year" not in df.columns:
         return df
@@ -305,15 +301,12 @@ def get_slots_per_day(meta: dict) -> int:
 
 
 def get_model_lookback_steps(meta: dict) -> int:
-    # 优先取预处理里保存的 lookback_steps
     if meta and "lookback_steps" in meta:
         return int(meta["lookback_steps"])
 
-    # 兼容旧 meta
     if meta and "lookback" in meta:
         return int(meta["lookback"])
 
-    # 兜底：你当前 ONNX 模型固定输入要求
     return 180
 
 
@@ -323,9 +316,6 @@ def get_crime_types(meta: dict):
     return CRIME_TYPES_DEFAULT
 
 
-# =========================
-# Prediction helpers
-# =========================
 def run_inference(session, x_array: np.ndarray):
     input_name = session.get_inputs()[0].name
     output_name = session.get_outputs()[0].name
@@ -333,13 +323,11 @@ def run_inference(session, x_array: np.ndarray):
     pred = session.run([output_name], {input_name: x_array.astype(np.float32)})[0]
     pred = np.asarray(pred)
 
-    # 兼容常见导出形状
     if pred.ndim == 4 and pred.shape[2] == 1:
         pred = np.squeeze(pred, axis=2)
     if pred.ndim == 3:
         pred = pred[0]
 
-    # 预期: (C, N)
     if pred.ndim != 2:
         raise ValueError(f"Unexpected ONNX output ndim: {pred.ndim}, shape={pred.shape}")
 
@@ -354,9 +342,9 @@ def prepare_model_input(window_lnc: np.ndarray) -> np.ndarray:
     return: (1, C, L, N)
     """
     x = np.asarray(window_lnc, dtype=np.float32)
-    x = np.transpose(x, (2, 0, 1))   # (C, L, N)
+    x = np.transpose(x, (2, 0, 1))
     x = np.log1p(x)
-    x = np.expand_dims(x, 0)         # (1, C, L, N)
+    x = np.expand_dims(x, 0)
     return x.astype(np.float32)
 
 
@@ -377,19 +365,18 @@ def recursive_forecast_daily(session, tensor, meta, forecast_days=FORECAST_DAYS)
 
     horizon_steps = forecast_days * slots_per_day
 
-    # 用最后 lookback_steps 作为输入窗口
-    window = np.asarray(tensor[-lookback_steps:], dtype=np.float32)  # (L, N, C)
+    window = np.asarray(tensor[-lookback_steps:], dtype=np.float32)
     step_preds = []
 
     for _ in range(horizon_steps):
-        x_input = prepare_model_input(window)        # (1, C, L, N)
-        y_pred = run_inference(session, x_input)     # (C, N)
+        x_input = prepare_model_input(window)
+        y_pred = run_inference(session, x_input)
         step_preds.append(y_pred)
 
-        next_step = np.transpose(y_pred, (1, 0))     # (N, C)
+        next_step = np.transpose(y_pred, (1, 0))
         window = np.concatenate([window[1:], next_step[None, :, :]], axis=0)
 
-    step_preds = np.asarray(step_preds, dtype=np.float32)  # (H, C, N)
+    step_preds = np.asarray(step_preds, dtype=np.float32)
     daily_preds = step_preds.reshape(forecast_days, slots_per_day, step_preds.shape[1], step_preds.shape[2]).sum(axis=1)
 
     info = {
@@ -411,10 +398,6 @@ def precompute_daily_predictions(mode, forecast_days=FORECAST_DAYS):
 
 
 def build_forecast_dates(meta: dict, forecast_days=FORECAST_DAYS):
-    """
-    从 meta 里的 end_date 往后推。
-    如果没有 end_date，就从今天开始。
-    """
     if meta and "end_date" in meta:
         last_real_day = pd.Timestamp(meta["end_date"])
         start_day = last_real_day + pd.Timedelta(days=1)
@@ -423,10 +406,6 @@ def build_forecast_dates(meta: dict, forecast_days=FORECAST_DAYS):
 
     return [start_day + pd.Timedelta(days=i) for i in range(forecast_days)]
 
-
-# =========================
-# Visualization
-# =========================
 def get_grid_shape(meta: dict):
     n_rows = int(meta.get("n_rows", 43))
     n_cols = int(meta.get("n_cols", 35))
@@ -532,9 +511,6 @@ def render_prediction_results(y_pred, art, source_name, crime_types):
     render_metrics_panel(art)
 
 
-# =========================
-# Page renderers
-# =========================
 def render_eda_page(art):
     st.header("EDA Dashboard")
 
@@ -643,6 +619,10 @@ def render_prediction_page(art):
         st.error(f"Failed to precompute future predictions: {e}")
         return
 
+    if st.sidebar.button("Clear cached predictions"):
+    st.cache_data.clear()
+    st.rerun()
+
     crime_types = get_crime_types(meta)
     forecast_dates = build_forecast_dates(meta, FORECAST_DAYS)
 
@@ -652,7 +632,6 @@ def render_prediction_page(art):
         f"({info['horizon_steps']} slot-level forecasts aggregated to daily results)."
     )
 
-    # 日期选择
     date_options = list(range(len(forecast_dates)))
     selected_idx = st.selectbox(
         "Select forecast date",
@@ -663,7 +642,6 @@ def render_prediction_page(art):
     selected_date = pd.Timestamp(forecast_dates[selected_idx])
     selected_pred = daily_preds[selected_idx]  # (C, N)
 
-    # 日期条
     with st.expander("Available forecast window"):
         df_dates = pd.DataFrame({
             "Index": np.arange(len(forecast_dates)),
@@ -701,9 +679,6 @@ def render_about_page(art):
             st.json(art["metrics_overall"])
 
 
-# =========================
-# Main
-# =========================
 def main():
     art = load_artifacts()
 
