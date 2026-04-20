@@ -1,6 +1,6 @@
 import json
 from pathlib import Path
-from datetime import datetime, timedelta
+from datetime import datetime
 
 import numpy as np
 import pandas as pd
@@ -12,6 +12,7 @@ import onnxruntime as ort
 from pandas.tseries.holiday import USFederalHolidayCalendar
 
 
+
 APP_DIR = Path(__file__).resolve().parent
 ART_DIR = APP_DIR / "artifacts"
 DATA_DIR = ART_DIR / "data_v2"
@@ -21,11 +22,21 @@ OUTPUT_DIR = APP_DIR / "outputs"
 
 LAT_COL, LON_COL = "Latitude", "Longitude"
 CRIME_TYPES_DEFAULT = ["THEFT", "BATTERY", "CRIMINAL DAMAGE", "ASSAULT", "DECEPTIVE PRACTICE"]
+
 FORECAST_DAYS = 30
+
+SLOT_LABELS = [
+    "00:00–03:59",
+    "04:00–07:59",
+    "08:00–11:59",
+    "12:00–15:59",
+    "16:00–19:59",
+    "20:00–23:59",
+]
 
 st.set_page_config(page_title="Chicago Crime Analytics + STGCN Forecast", layout="wide")
 st.title("Chicago Crime Analytics and STGCN Prediction Dashboard")
-st.caption("EDA + ONNX spatiotemporal forecasting + calendar-based EVA")
+st.caption("EDA + ONNX spatiotemporal forecasting + interactive calendar-based EVA")
 
 
 def first_existing(*paths: Path):
@@ -45,6 +56,7 @@ def safe_read_json(path: Path):
             return json.load(f)
     return None
 
+
 @st.cache_data
 def load_artifacts():
     art = {}
@@ -62,6 +74,7 @@ def load_artifacts():
     art["grid"] = safe_read_csv(ART_DIR / "spatial_grid_precomputed.csv")
     art["points"] = safe_read_csv(ART_DIR / "sample_points.csv")
 
+    # Metrics
     art["metrics_overall"] = safe_read_json(
         first_existing(APP_DIR / "metrics_overall.json", ART_DIR / "metrics_overall.json")
     )
@@ -72,8 +85,10 @@ def load_artifacts():
         first_existing(OUTPUT_DIR / "split_info.json", APP_DIR / "split_info.json", ART_DIR / "split_info.json")
     )
 
+    # Data_v2 meta
     art["meta"] = safe_read_json(DATA_DIR / "meta.json")
 
+    # Images
     art["images"] = {}
     image_names = [
         "metrics_by_crime_type.png",
@@ -87,6 +102,7 @@ def load_artifacts():
         if p:
             art["images"][name] = p
 
+    # Cleanup
     if art["daily"] is not None and "Date" in art["daily"].columns:
         art["daily"]["Date"] = pd.to_datetime(art["daily"]["Date"], errors="coerce")
         art["daily"] = art["daily"].dropna(subset=["Date"]).sort_values("Date")
@@ -98,6 +114,7 @@ def load_artifacts():
         art["points"] = art["points"].dropna(subset=[LAT_COL, LON_COL])
 
     return art
+
 
 def filter_year(df: pd.DataFrame, year_range):
     if df is None or "Year" not in df.columns:
@@ -258,17 +275,11 @@ def load_onnx_session():
     return session
 
 @st.cache_data
-def load_tensor_and_meta(mode="Demo"):
+def load_tensor_and_meta():
     meta = safe_read_json(DATA_DIR / "meta.json")
-
-    if mode == "Demo":
-        tensor_path = DATA_DIR / "demo_tensor.npy"
-    else:
-        tensor_path = DATA_DIR / "tensor.npy"
-
-    if not tensor_path.exists():
-        raise FileNotFoundError(f"Missing tensor file: {tensor_path}")
-
+    tensor_path = first_existing(DATA_DIR / "tensor.npy", DATA_DIR / "demo_tensor.npy")
+    if tensor_path is None:
+        raise FileNotFoundError("Neither tensor.npy nor demo_tensor.npy was found in artifacts/data_v2/")
     tensor = np.load(tensor_path, mmap_mode="r")
     return tensor, meta
 
@@ -280,10 +291,8 @@ def get_slots_per_day(meta: dict) -> int:
 def get_model_lookback_steps(meta: dict) -> int:
     if meta and "lookback_steps" in meta:
         return int(meta["lookback_steps"])
-
     if meta and "lookback" in meta:
         return int(meta["lookback"])
-
     return 180
 
 
@@ -319,16 +328,18 @@ def prepare_model_input(window_lnc: np.ndarray) -> np.ndarray:
     return: (1, C, L, N)
     """
     x = np.asarray(window_lnc, dtype=np.float32)
-    x = np.transpose(x, (2, 0, 1))
+    x = np.transpose(x, (2, 0, 1))  
     x = np.log1p(x)
-    x = np.expand_dims(x, 0)
+    x = np.expand_dims(x, 0) 
     return x.astype(np.float32)
 
 
-def recursive_forecast_daily(session, tensor, meta, forecast_days=FORECAST_DAYS):
+def recursive_forecast_slots(session, tensor, meta, forecast_days=FORECAST_DAYS):
     """
     tensor: (T, N, C)
-    输出:
+
+    returns:
+      slot_preds: (forecast_days, slots_per_day, C, N)
       daily_preds: (forecast_days, C, N)
       info: dict
     """
@@ -342,11 +353,11 @@ def recursive_forecast_daily(session, tensor, meta, forecast_days=FORECAST_DAYS)
 
     horizon_steps = forecast_days * slots_per_day
 
-    window = np.asarray(tensor[-lookback_steps:], dtype=np.float32)
+    window = np.asarray(tensor[-lookback_steps:], dtype=np.float32) 
     step_preds = []
 
     for _ in range(horizon_steps):
-        x_input = prepare_model_input(window)
+        x_input = prepare_model_input(window) 
         y_pred = run_inference(session, x_input)
         step_preds.append(y_pred)
 
@@ -354,7 +365,15 @@ def recursive_forecast_daily(session, tensor, meta, forecast_days=FORECAST_DAYS)
         window = np.concatenate([window[1:], next_step[None, :, :]], axis=0)
 
     step_preds = np.asarray(step_preds, dtype=np.float32)
-    daily_preds = step_preds.reshape(forecast_days, slots_per_day, step_preds.shape[1], step_preds.shape[2]).sum(axis=1)
+
+    slot_preds = step_preds.reshape(
+        forecast_days,
+        slots_per_day,
+        step_preds.shape[1],
+        step_preds.shape[2]
+    ) 
+
+    daily_preds = slot_preds.sum(axis=1)
 
     info = {
         "lookback_steps": lookback_steps,
@@ -363,15 +382,15 @@ def recursive_forecast_daily(session, tensor, meta, forecast_days=FORECAST_DAYS)
         "horizon_steps": horizon_steps,
         "tensor_steps": int(tensor.shape[0]),
     }
-    return daily_preds, info
+    return slot_preds, daily_preds, info
 
 
 @st.cache_data
-def precompute_daily_predictions(mode, forecast_days=FORECAST_DAYS):
-    tensor, meta = load_tensor_and_meta(mode)
+def precompute_predictions(forecast_days=FORECAST_DAYS):
+    tensor, meta = load_tensor_and_meta()
     session = load_onnx_session()
-    daily_preds, info = recursive_forecast_daily(session, tensor, meta, forecast_days=forecast_days)
-    return daily_preds, meta, info
+    slot_preds, daily_preds, info = recursive_forecast_slots(session, tensor, meta, forecast_days=forecast_days)
+    return slot_preds, daily_preds, meta, info
 
 
 def build_forecast_dates(meta: dict, forecast_days=FORECAST_DAYS):
@@ -383,6 +402,7 @@ def build_forecast_dates(meta: dict, forecast_days=FORECAST_DAYS):
 
     return [start_day + pd.Timedelta(days=i) for i in range(forecast_days)]
 
+
 def get_grid_shape(meta: dict):
     n_rows = int(meta.get("n_rows", 43))
     n_cols = int(meta.get("n_cols", 35))
@@ -391,11 +411,10 @@ def get_grid_shape(meta: dict):
     return n_rows, n_cols
 
 
-def plot_prediction_summary(y_pred, crime_types):
+def plot_prediction_summary(y_pred, crime_types, title="Predicted Crime Count by Type"):
     total_by_type = y_pred.sum(axis=1)
     pred_df = pd.DataFrame({"Crime Type": crime_types, "Predicted Count": total_by_type})
-    fig = px.bar(pred_df, x="Crime Type", y="Predicted Count", color="Crime Type",
-                 title="Predicted Daily Crime Count by Type")
+    fig = px.bar(pred_df, x="Crime Type", y="Predicted Count", color="Crime Type", title=title)
     st.plotly_chart(fig, use_container_width=True)
 
 
@@ -423,7 +442,52 @@ def plot_top_grids(y_pred, crime_types, top_k=20):
                 "Predicted Value": float(vals[idx]),
             })
     out = pd.DataFrame(rows)
-    st.dataframe(out, use_container_width=True)
+    st.dataframe(out, use_container_width=True, hide_index=True)
+
+
+def plot_intraday_total(slot_preds_day, slot_labels):
+    slot_totals = slot_preds_day.sum(axis=(1, 2))
+    df_ = pd.DataFrame({
+        "4H Slot": slot_labels[:len(slot_totals)],
+        "Predicted Count": slot_totals
+    })
+    fig = px.line(
+        df_,
+        x="4H Slot",
+        y="Predicted Count",
+        markers=True,
+        title="Intraday Predicted Crime Volume"
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+
+def plot_intraday_by_crime(slot_preds_day, crime_types, slot_labels):
+    rows = []
+    for s in range(slot_preds_day.shape[0]):
+        for c_idx, ctype in enumerate(crime_types):
+            rows.append({
+                "4H Slot": slot_labels[s],
+                "Crime Type": ctype,
+                "Predicted Count": float(slot_preds_day[s, c_idx].sum())
+            })
+    df_ = pd.DataFrame(rows)
+    fig = px.line(
+        df_,
+        x="4H Slot",
+        y="Predicted Count",
+        color="Crime Type",
+        markers=True,
+        title="Intraday Crime-Type Pattern"
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+
+def plot_forecast_window_table(forecast_dates):
+    df_dates = pd.DataFrame({
+        "Index": np.arange(len(forecast_dates)),
+        "Date": [pd.Timestamp(d).strftime("%Y-%m-%d") for d in forecast_dates]
+    })
+    st.dataframe(df_dates, use_container_width=True, hide_index=True)
 
 
 def render_metrics_panel(art):
@@ -439,6 +503,10 @@ def render_metrics_panel(art):
         c1.metric("Avg Test MAE", f"{metrics_overall.get('avg_test_mae', 0):.4f}")
         c2.metric("Avg Test RMSE", f"{metrics_overall.get('avg_test_rmse', 0):.4f}")
         c3.metric("Avg Test Accuracy", f"{metrics_overall.get('avg_test_acc', 0):.4f}")
+    else:
+        c1.info("No metrics_overall.json")
+        c2.info("No metrics_overall.json")
+        c3.info("No metrics_overall.json")
 
     if split_info and isinstance(split_info, dict) and "fields_used" in split_info:
         st.info(
@@ -470,23 +538,22 @@ def render_metrics_panel(art):
             st.image(str(imgs[name]), caption=name)
 
 
-def render_prediction_results(y_pred, art, source_name, crime_types):
+def render_slot_prediction_results(y_pred, art, source_name, crime_types):
     st.subheader(source_name)
 
-    plot_prediction_summary(y_pred, crime_types)
+    col1, col2 = st.columns([1.15, 1])
 
-    meta = art["meta"] if art.get("meta") else {}
-    crime_choice = st.selectbox("Select crime type for hotspot map", crime_types, index=0)
-    type_idx = crime_types.index(crime_choice)
+    with col1:
+        plot_prediction_summary(y_pred, crime_types, title="Predicted 4H Crime Count by Type")
 
-    plot_hotspot_heatmap(y_pred[type_idx], meta, f"Predicted Daily Hotspot: {crime_choice}")
+    with col2:
+        meta = art["meta"] if art.get("meta") else {}
+        crime_choice = st.selectbox("Select crime type for hotspot map", crime_types, index=0, key="slot_crime_choice")
+        type_idx = crime_types.index(crime_choice)
+        plot_hotspot_heatmap(y_pred[type_idx], meta, f"Predicted 4H Hotspot: {crime_choice}")
 
-    with st.expander("Top predicted grids"):
+    with st.expander("Top predicted grids in current 4H slice"):
         plot_top_grids(y_pred, crime_types, top_k=20)
-
-    st.divider()
-    render_metrics_panel(art)
-
 
 def render_eda_page(art):
     st.header("EDA Dashboard")
@@ -587,47 +654,96 @@ def render_eda_page(art):
             plot_gistar(grid)
 
 
-def render_prediction_page(art):
+def render_forecast_page(art):
     st.header("Forecast Calendar")
 
     try:
-        daily_preds, meta, info = precompute_daily_predictions(FORECAST_DAYS)
+        slot_preds, daily_preds, meta, info = precompute_predictions(FORECAST_DAYS)
     except Exception as e:
         st.error(f"Failed to precompute future predictions: {e}")
         return
 
     crime_types = get_crime_types(meta)
     forecast_dates = build_forecast_dates(meta, FORECAST_DAYS)
+    slots_per_day = info["slots_per_day"]
+    slot_labels = SLOT_LABELS[:slots_per_day]
 
     st.info(
         f"Using the latest {info['lookback_steps']} time steps as model input, "
         f"rolling forward {info['forecast_days']} days "
-        f"({info['horizon_steps']} slot-level forecasts aggregated to daily results)."
+        f"({info['horizon_steps']} slot-level forecasts). "
+        f"The main display below is based on 4-hour slices."
     )
 
-    date_options = list(range(len(forecast_dates)))
-    selected_idx = st.selectbox(
-        "Select forecast date",
-        options=date_options,
-        format_func=lambda i: pd.Timestamp(forecast_dates[i]).strftime("%Y-%m-%d"),
-    )
+    day_col, slot_col = st.columns([1.2, 1])
 
-    selected_date = pd.Timestamp(forecast_dates[selected_idx])
-    selected_pred = daily_preds[selected_idx]  # (C, N)
+    with day_col:
+        selected_day_idx = st.selectbox(
+            "Select forecast date",
+            options=list(range(len(forecast_dates))),
+            format_func=lambda i: pd.Timestamp(forecast_dates[i]).strftime("%Y-%m-%d"),
+        )
+
+    with slot_col:
+        selected_slot_idx = st.radio(
+            "Select 4-hour slot",
+            options=list(range(slots_per_day)),
+            format_func=lambda i: slot_labels[i],
+            horizontal=True
+        )
+
+    selected_date = pd.Timestamp(forecast_dates[selected_day_idx])
+    selected_slot_pred = slot_preds[selected_day_idx, selected_slot_idx] 
+    selected_daily_pred = daily_preds[selected_day_idx]
+    selected_day_slots = slot_preds[selected_day_idx] 
 
     with st.expander("Available forecast window"):
-        df_dates = pd.DataFrame({
-            "Index": np.arange(len(forecast_dates)),
-            "Date": [pd.Timestamp(d).strftime("%Y-%m-%d") for d in forecast_dates]
-        })
-        st.dataframe(df_dates, use_container_width=True, hide_index=True)
+        plot_forecast_window_table(forecast_dates)
 
-    render_prediction_results(
-        selected_pred,
+    st.subheader(f"Forecast for {selected_date.strftime('%Y-%m-%d')}")
+
+    top_left, top_right = st.columns([1, 1])
+
+    with top_left:
+        plot_intraday_total(selected_day_slots, slot_labels)
+
+    with top_right:
+        plot_intraday_by_crime(selected_day_slots, crime_types, slot_labels)
+
+    st.divider()
+
+    render_slot_prediction_results(
+        selected_slot_pred,
         art,
-        source_name=f"Predicted crime distribution for {selected_date.strftime('%Y-%m-%d')}",
-        crime_types=crime_types
+        source_name=f"Selected 4H slice: {selected_date.strftime('%Y-%m-%d')} | {slot_labels[selected_slot_idx]}",
+        crime_types=crime_types,
     )
+
+    st.divider()
+    st.subheader("Daily aggregate reference")
+
+    ref_col1, ref_col2 = st.columns([1.15, 1])
+
+    with ref_col1:
+        plot_prediction_summary(selected_daily_pred, crime_types, title="Daily Aggregate Crime Count by Type")
+
+    with ref_col2:
+        meta_local = art["meta"] if art.get("meta") else {}
+        daily_crime_choice = st.selectbox(
+            "Select crime type for daily hotspot reference",
+            crime_types,
+            index=0,
+            key="daily_crime_choice"
+        )
+        daily_type_idx = crime_types.index(daily_crime_choice)
+        plot_hotspot_heatmap(
+            selected_daily_pred[daily_type_idx],
+            meta_local,
+            f"Daily Aggregate Hotspot: {daily_crime_choice}"
+        )
+
+    with st.expander("Top predicted grids in daily aggregate"):
+        plot_top_grids(selected_daily_pred, crime_types, top_k=20)
 
 
 def render_about_page(art):
@@ -637,10 +753,12 @@ def render_about_page(art):
         This dashboard combines:
         - EDA for Chicago crime data
         - ONNX-based STGCN forecasting
-        - Calendar-based future daily prediction
-        - Static model evaluation artifacts
+        - Interactive forecast inspection with date + 4-hour slot selection
+        - Model evaluation artifacts and metadata
         """
     )
+
+    st.subheader("Model / Data Information")
     if art.get("meta"):
         with st.expander("meta.json"):
             st.json(art["meta"])
@@ -651,6 +769,8 @@ def render_about_page(art):
         with st.expander("metrics_overall.json"):
             st.json(art["metrics_overall"])
 
+    st.divider()
+    render_metrics_panel(art)
 
 def main():
     art = load_artifacts()
@@ -659,10 +779,16 @@ def main():
         st.header("Navigation")
         page = st.radio("Go to", ["EDA", "Forecast", "About"])
 
+        st.divider()
+        if st.button("Clear cache and rerun"):
+            st.cache_data.clear()
+            st.cache_resource.clear()
+            st.rerun()
+
     if page == "EDA":
         render_eda_page(art)
     elif page == "Forecast":
-        render_prediction_page(art)
+        render_forecast_page(art)
     else:
         render_about_page(art)
 
